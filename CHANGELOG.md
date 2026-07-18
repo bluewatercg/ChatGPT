@@ -4,6 +4,34 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.6] - 2026-07-18
+
+### Added
+
+- Subagents inherit the main agent's context-size limit (auto-compaction applies)
+- Expandable, collapsed-by-default task prompt inside the subagent chat view
+
+### Fixed
+
+- Delete tool timing out but not stopping (abort-aware `unlink`/backup read)
+- Read supports paths with spaces; directory paths return a clear error
+- Chat scrolls to the very bottom when returning to the main agent (tab switch / Back)
+
+### Removed
+
+- Outer timeout budget on subagent Tasks (nested tools already have their own timeouts)
+
+### Changed
+
+- TodoWrite / TodoRead timeout tripled
+- Tool outputs trimmed to send fewer tokens to the model (only tools; prompts unchanged)
+- Shell result drops pid/running-for/echoed-command header when done; middle-truncated 12k body with collapsed blank lines
+- Read caps whole-file reads at 1500 lines with a continue hint (was uncapped)
+- ListDir caps at 300 entries (dirs first) with a "more" hint
+- SemanticSearch returns 8 hits (was 12), each chunk snippet-capped at 1200 chars
+- SearchDocs excerpts snippet-capped at 1200 chars
+- Grep abort/timeout output cap 50k → 12k
+
 ## [0.0.5] - 2026-07-15
 
 ### Added
