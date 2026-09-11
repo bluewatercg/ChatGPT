@@ -177,10 +177,12 @@ export function branchDiffItem(): MentionItem {
 
 const MAX_BLOCK = 8000;
 
-async function readFileSafe(rel: string): Promise<string> {
+async function readFileSafe(rel: string, range?: { start: number; end: number }): Promise<string> {
   try {
     const abs = path.isAbsolute(rel) ? rel : path.join(getWorkspaceRoot(), rel);
-    return (await fs.readFile(abs, "utf8")).slice(0, MAX_BLOCK);
+    const text = await fs.readFile(abs, "utf8");
+    const selected = range ? text.split("\n").slice(range.start - 1, range.end).join("\n") : text;
+    return selected.length > MAX_BLOCK ? selected.slice(0, MAX_BLOCK) + "\n[Selected context truncated; use Read for more.]" : selected;
   } catch {
     return "";
   }
@@ -208,9 +210,10 @@ export async function resolveMentions(
         case "code": {
           const [, rel, s, e] = /^(.+):(\d+)-(\d+)$/.exec(m.path) ?? [];
           if (!rel) break;
-          const text = await readFileSafe(rel);
-          const lines = text.split("\n").slice(Number(s) - 1, Number(e));
-          blocks.push(`<attached_code path="${rel}" lines="${s}-${e}">\n${lines.join("\n")}\n</attached_code>`);
+          const start = Number(s), end = Number(e);
+          if (start < 1 || end < start) break;
+          const text = await readFileSafe(rel, { start, end });
+          blocks.push(`<attached_code path="${rel}" lines="${s}-${e}">\n${text}\n</attached_code>`);
           break;
         }
         case "rule": {

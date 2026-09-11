@@ -19,7 +19,7 @@ export interface ModelParams {
   reasoningEffort?: string;
   /** Thinking mode: "disabled" | "adaptive" | "enabled" (Anthropic). */
   thinking?: string;
-  /** Selected context window (e.g. "200k", "1m"). "1m" enables the Anthropic beta. */
+  /** Local working-context budget (e.g. "200k", "1m"); does not change the model's window. */
   maxContext?: string;
 }
 
@@ -46,6 +46,8 @@ export interface StreamChatOpts {
   anthropic?: boolean;
   /** OAuth account provider (Claude Code / Codex) — overrides apiBaseUrl/apiKey. */
   oauthKind?: OAuthKind;
+  /** Stable conversation/run key for provider prompt-cache routing. */
+  promptCacheKey?: string;
   signal: AbortSignal;
   /** Max total attempts per request (default 3). */
   maxRetries?: number;

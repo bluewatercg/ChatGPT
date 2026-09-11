@@ -10,8 +10,25 @@
 import { ProviderEvent, ToolCall, ToolSchema, WireMessage, WireContentPart } from "./types";
 import { streamOAuthChat, type OAuthKind } from "./oauth";
 import type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
+import { MODEL_CATALOG } from "../stores/featureStore";
+import { defaultAnthropicMaxTokens } from "./providerLimits";
+import { applyAnthropicReasoning, needsContext1mBeta } from "./provider/anthropicReasoning";
+import { AnthropicUsageTracker } from "./anthropicUsage";
+import { toAnthropic } from "./provider/anthropicMessages";
+import { sseData } from "./provider/sse";
+import { UsageTracker } from "./provider/usage";
+import { applyGoogleOpenAIOptions, googleThoughtSignature, googleToolCall, isGoogleOpenAIEndpoint, prepareGoogleMessages } from "./provider/google";
+import { createOpenAIResponsesRequest, OpenAIResponsesError, parseOpenAIResponses, shouldUseOpenAIResponses } from "./provider/openaiResponses";
+import { applyOpenAIChatOptions } from "./provider/openaiChat";
+import { randomUUID } from "crypto";
 
 export type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
+export { defaultAnthropicMaxTokens } from "./providerLimits";
+
+/** Strip trailing slashes from a base URL to avoid double-slash in constructed paths. */
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "");
+}
 
 function applyOpenAISampling(body: Record<string, unknown>, s?: SamplingParams) {
   if (!s) return;
@@ -24,99 +41,11 @@ function applyOpenAISampling(body: Record<string, unknown>, s?: SamplingParams) 
   if (s.topK != null) body.top_k = s.topK;
 }
 
-/** Models that take the `effort` param as a stable feature (no beta header). */
-const ANTHROPIC_EFFORT_STABLE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-/** Opus 4.5 needs the effort beta header + manual thinking budget. */
-const ANTHROPIC_EFFORT_BETA = /claude-opus-4-5/i;
-/** Models that support adaptive thinking (no budget_tokens). */
-const ANTHROPIC_ADAPTIVE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-/** Models that reject manual `thinking:{type:enabled,budget_tokens}` with a 400.
- * Per docs: Opus 5, Opus 4.8/4.7, Sonnet 5, Fable 5, Mythos 5 → adaptive only. */
-const ANTHROPIC_NO_MANUAL = /claude-(opus-4-[78]|opus-5|sonnet-5|fable-5|mythos)/i;
-/** Opus 5 rejects `thinking:{type:disabled}` when effort is xhigh/max (400). */
-const ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT = /claude-opus-5/i;
-/** Fable 5 / Mythos 5: thinking is always on — `disabled` returns 400 at any effort. */
-const ANTHROPIC_NO_DISABLE = /claude-(fable-5|mythos)/i;
+export { applyAnthropicReasoning, needsContext1mBeta } from "./provider/anthropicReasoning";
+
 /** Models that reject temperature / top_p / top_k with a 400. */
 const ANTHROPIC_NO_SAMPLING = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-/** Models where 1M context is the default (no context-1m beta header needed). */
-const ANTHROPIC_NATIVE_1M = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-
-/** Default max_tokens when the user left response length at "auto" (0).
- * Adaptive / always-on thinking models burn this budget before text, so leave
- * headroom — docs recommend ≥64k at xhigh/max. */
-export function defaultAnthropicMaxTokens(model: string, effort?: string): number {
-  if (ANTHROPIC_ADAPTIVE.test(model) || ANTHROPIC_NO_DISABLE.test(model)) {
-    if (effort === "xhigh" || effort === "max") return 65_536;
-    return 32_768;
-  }
-  return 8192;
-}
-
-/** Whether the retired context-1m beta header is still useful for this model. */
-export function needsContext1mBeta(model: string): boolean {
-  return !ANTHROPIC_NATIVE_1M.test(model);
-}
-
-/**
- * Apply Anthropic thinking + effort to a request body, returning any beta flags
- * to add to the `anthropic-beta` header. Centralizes the per-model rules:
- *  - effort → `output_config.effort` (low/medium/high/xhigh/max)
- *  - 4.6+ → adaptive thinking (no budget); Opus 4.5 → manual budget + beta header
- */
-export function applyAnthropicReasoning(
-  body: Record<string, unknown>,
-  model: string,
-  maxTokens: number,
-  params?: ModelParams,
-): string[] {
-  const betas: string[] = [];
-  let mode = params?.thinking; // "disabled" | "adaptive" | "enabled" | undefined
-  let effort = params?.reasoningEffort;
-
-  // Fable/Mythos reject thinking:{disabled} entirely — coerce to adaptive.
-  if (mode === "disabled" && ANTHROPIC_NO_DISABLE.test(model)) {
-    mode = "adaptive";
-  }
-
-  // Opus 5 rejects thinking:{disabled} above `high` effort. Clamp rather than
-  // sending a request we know will 400.
-  if (mode === "disabled" && effort && ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT.test(model)
-    && (effort === "xhigh" || effort === "max")) {
-    effort = "high";
-  }
-
-  if (effort && (ANTHROPIC_EFFORT_STABLE.test(model) || ANTHROPIC_EFFORT_BETA.test(model))) {
-    body.output_config = { effort };
-    if (ANTHROPIC_EFFORT_BETA.test(model)) betas.push("effort-2025-11-24");
-  }
-
-  // Thinking is on by default from Opus 5 onward, so opting out has to be explicit.
-  if (mode === "disabled" && ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT.test(model)) {
-    body.thinking = { type: "disabled" };
-  }
-
-  if (mode && mode !== "disabled") {
-    const canAdaptive = ANTHROPIC_ADAPTIVE.test(model);
-    const canManual = !ANTHROPIC_NO_MANUAL.test(model);
-    // Manual mode only where the API still accepts it AND the user asked for it
-    // (or the model can't do adaptive, e.g. Haiku 4.5 / older Claude 4).
-    const useManual = canManual && (mode === "enabled" || !canAdaptive);
-    if (useManual) {
-      // `thinking.enabled` requires budget_tokens; scale it by effort.
-      const frac = { low: 0.15, medium: 0.3, high: 0.5, xhigh: 0.7, max: 0.85 }[effort ?? "high"] ?? 0.5;
-      body.thinking = { type: "enabled", budget_tokens: Math.max(1024, Math.floor(maxTokens * frac)) };
-      body.temperature = 1; // required when manual thinking is enabled
-    } else {
-      // Adaptive-only models (Opus 5/4.8/4.7, Sonnet 5, Fable 5, Mythos): the model
-      // decides when/how much to think; effort steers depth. No budget_tokens.
-      // `display` defaults to "omitted" → thinking happens but blocks come back
-      // empty; ask for "summarized" so summaries stream.
-      body.thinking = { type: "adaptive", display: "summarized" };
-    }
-  }
-  return betas;
-}
+const ANTHROPIC_DEFAULT_THINKING = /claude-(opus-5|sonnet-5|fable-5|mythos)/i;
 
 function applyAnthropicSampling(body: Record<string, unknown>, model: string, s?: SamplingParams) {
   if (!s || ANTHROPIC_NO_SAMPLING.test(model)) return;
@@ -136,8 +65,21 @@ export async function listModels(apiBaseUrl: string, apiKey: string, anthropic?:
     : apiKey
     ? { authorization: `Bearer ${apiKey}` }
     : {};
-  const r = await fetch(`${apiBaseUrl}/models`, { headers });
+  const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/models`, { headers });
   if (!r.ok) {
+    // Anthropic's official API does not expose a /models endpoint (404 expected).
+    // MIMO (xiaomimimo.com) may also 404 on /models depending on the plan/region.
+    // Fall back to the hardcoded catalog so these providers still work.
+    if (useAnthropic || /xiaomimimo\.com/i.test(apiBaseUrl)) {
+      const kind = useAnthropic ? "anthropic" : "mimo";
+      return MODEL_CATALOG
+        .filter((m) => {
+          const kinds = Array.isArray(m.kind) ? m.kind : [m.kind];
+          return kinds.includes(kind);
+        })
+        .map((m) => ({ id: m.id }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+    }
     throw new Error(`models ${r.status}: ${await r.text()}`);
   }
   const d = (await r.json()) as { data?: { id: string }[] };
@@ -156,11 +98,11 @@ export class ChatHTTPError extends Error {
   }
 }
 
-/** Transient if: no status (network/DNS/timeout), 408/425/429, or any 5xx. */
+/** Transient if: no status (network/DNS/timeout), 408/425/429/499, or any 5xx. */
 export function isRetryableError(e: unknown): boolean {
   if (e instanceof DOMException && e.name === "AbortError") return false;
   if (e instanceof ChatHTTPError) {
-    return e.status === 408 || e.status === 425 || e.status === 429 || e.status >= 500;
+    return e.status === 408 || e.status === 425 || e.status === 429 || e.status === 499 || e.status >= 500;
   }
   // fetch network failures (TypeError "Failed to fetch", ECONNRESET, etc.) are retryable.
   return true;
@@ -184,17 +126,19 @@ async function* streamWithRetry(
   make: () => AsyncGenerator<ProviderEvent>,
   signal: AbortSignal,
   onRetry?: (attempt: number, max: number, delayMs: number, error: string) => void,
-  maxAttempts = 3,
+  maxAttempts = 5,
+  model?: string,
 ): AsyncGenerator<ProviderEvent> {
   for (let attempt = 1; ; attempt++) {
+    const requestId = randomUUID();
     // Stream live. Retry is only safe before the first event is emitted — once we
     // start yielding deltas downstream, replaying a fresh attempt would duplicate
     // output, so a mid-stream failure is surfaced instead of retried.
     let emitted = false;
     try {
       for await (const ev of make()) {
-        emitted = true;
-        yield ev;
+        if (ev.type !== "usage") emitted = true;
+        yield ev.type === "usage" ? { ...ev, requestId, model } : ev;
       }
       return;
     } catch (e) {
@@ -204,7 +148,7 @@ async function* streamWithRetry(
       if (emitted || attempt >= maxAttempts || !isRetryableError(e)) {
         throw e;
       }
-      const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 30000);
       onRetry?.(attempt, maxAttempts, delay, e instanceof Error ? e.message : String(e));
       await sleep(delay, signal);
     }
@@ -240,9 +184,15 @@ function openAIContent(content: string | WireContentPart[] | null | undefined): 
  * Tool images → tool text + trailing user image message.
  * Returns plain objects (not only WireMessage) so tool-only assistant can omit `content`.
  */
-function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknown>[] {
+function normalizeOpenAIMessages(messages: WireMessage[], googleModel?: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
-  for (const m of messages) {
+  let toolImages: WireContentPart[] = [];
+  const flushImages = () => {
+    if (toolImages.length) out.push({ role: "user", content: stripOpenAIParts(toolImages) });
+    toolImages = [];
+  };
+  for (const m of googleModel ? prepareGoogleMessages(messages, googleModel) : messages) {
+    if (m.role !== "tool") flushImages();
     if (m.role === "tool") {
       if (Array.isArray(m.content)) {
         const texts = m.content.filter((p): p is Extract<WireContentPart, { type: "text" }> => p.type === "text");
@@ -253,7 +203,7 @@ function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknow
           content: texts.map((t) => t.text).join("\n") || (images.length ? "(image)" : "(empty)"),
         });
         if (images.length) {
-          out.push({ role: "user", content: stripOpenAIParts(images) });
+          toolImages.push(...images);
         }
       } else {
         out.push({ role: "tool", tool_call_id: m.tool_call_id, content: m.content || "(empty)" });
@@ -266,7 +216,8 @@ function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknow
       // Never send null/empty content — Grok 400 "Empty content block".
       if (text) msg.content = text;
       else if (!m.tool_calls?.length) msg.content = "(empty)";
-      if (m.tool_calls?.length) msg.tool_calls = m.tool_calls;
+      if (m.tool_calls?.length) msg.tool_calls = googleModel ? m.tool_calls.map(googleToolCall)
+        : m.tool_calls.map(({ id, type, function: fn }) => ({ id, type, function: fn }));
       out.push(msg);
       continue;
     }
@@ -278,37 +229,67 @@ function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknow
     }
     out.push({ role: m.role, content });
   }
+  flushImages();
   return out;
 }
 
+export interface AuxiliaryRequestOptions {
+  signal?: AbortSignal;
+  onUsage?: (event: Extract<ProviderEvent, { type: "usage" }>) => void;
+}
+
+function auxiliarySignal(options?: AuxiliaryRequestOptions): AbortSignal {
+  const deadline = AbortSignal.timeout(30_000);
+  return options?.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+}
+
+/** Account a completed or rejected HTTP response before interpreting its answer. */
+async function auxiliaryResponse(r: Response, model: string, anthropic: boolean, label: string, options?: AuxiliaryRequestOptions): Promise<any> {
+  const text = await r.text();
+  let data: any;
+  try { data = parseMaybeSSE(text); } catch { /* preserve the HTTP error when the body is not JSON */ }
+  const usage = anthropic
+    ? new AnthropicUsageTracker().update(data?.usage)
+    : new UsageTracker().update(data?.usage?.prompt_tokens, data?.usage?.completion_tokens, data?.usage?.prompt_tokens_details?.cached_tokens);
+  if (usage) options?.onUsage?.({ ...usage, model, requestId: randomUUID() });
+  if (!r.ok) throw new ChatHTTPError(r.status, `${label} ${r.status}: ${text.slice(0, 200)}`);
+  if (data?.error) throw new ChatHTTPError(Number(data.error.status ?? data.error.code) || 502, `${label}: ${data.error.message || "provider returned an error"}`);
+  if (!data) throw new Error(`${label}: invalid provider response`);
+  return data;
+}
+
 /** Generate a short conversation title from the first user message using the model. */
-export async function generateTitle(apiBaseUrl: string, apiKey: string, model: string, userText: string, anthropic?: boolean, oauthKind?: OAuthKind): Promise<string> {
+export async function generateTitle(apiBaseUrl: string, apiKey: string, model: string, userText: string, anthropic?: boolean, oauthKind?: OAuthKind, options?: AuxiliaryRequestOptions): Promise<string> {
+  const signal = auxiliarySignal(options);
+  signal.throwIfAborted();
   const sys = "Generate a concise 3-6 word title for a chat that starts with the user's message. The title must summarize the topic, not repeat the message.";
   const prompt = userText.slice(0, 2000);
-  if (oauthKind) {
-    // OAuth providers have no raw HTTP endpoint here; stream a tiny completion.
+  const responses = shouldUseOpenAIResponses({ apiBaseUrl, model, anthropic, oauthKind });
+  const claude = oauthKind === "claude-code" || (!oauthKind && (anthropic ?? isAnthropic(apiBaseUrl)) && ANTHROPIC_DEFAULT_THINKING.test(model));
+  const google = !oauthKind && isGoogleOpenAIEndpoint(apiBaseUrl) && /^gemini-/i.test(model);
+  if (oauthKind || responses || claude || google) {
+    // Use the provider's transport, with room for required reasoning tokens.
+    // Fable's always-on thinking rejects forced tool calls, including set_title.
     let text = "";
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30_000);
-    try {
-      const gen = streamOAuthChat(oauthKind, {
-        model,
-        messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
-        maxTokens: 200,
-        signal: ctrl.signal,
-      });
-      for await (const ev of gen) {
-        if (ev.type === "text-delta") text += ev.text;
-      }
-    } finally {
-      clearTimeout(timer);
+    const gen = streamChat({
+      apiBaseUrl, apiKey, anthropic, oauthKind, maxRetries: 1,
+      model,
+      messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+      maxTokens: responses || claude || google ? 4096 : 200,
+      ...(responses || claude || google ? { modelParams: { reasoningEffort: google ? "none" : "low", ...(claude ? { thinking: "disabled" } : {}) } } : {}),
+      signal,
+    });
+    for await (const ev of gen) {
+      if (ev.type === "text-delta") text += ev.text;
+      if (ev.type === "usage") options?.onUsage?.(ev);
     }
     return cleanTitle(parseTitle(text) || text);
   }
   if (anthropic ?? isAnthropic(apiBaseUrl)) {
     // Force a tool call so the model returns a structured { title } object.
-    const r = await fetch(`${apiBaseUrl}/messages`, {
+    const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/messages`, {
       method: "POST",
+      signal,
       headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
       body: JSON.stringify({
         model,
@@ -320,25 +301,24 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
         tool_choice: { type: "tool", name: "set_title" },
       }),
     });
-    if (!r.ok) throw new Error(`title ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
-    const d: any = parseMaybeSSE(await r.text());
+    const d = await auxiliaryResponse(r, model, true, "title", options);
     const use = (d?.content ?? []).find((b: any) => b?.type === "tool_use");
     return cleanTitle(use?.input?.title ?? "");
   }
   const msgs = [{ role: "system", content: sys }, { role: "user", content: prompt }];
   const call = async (body: Record<string, unknown>) => {
-    const r = await fetch(`${apiBaseUrl}/chat/completions`, {
+    applyOpenAIChatOptions(body, apiBaseUrl, model, { auxiliary: true });
+    if (isGoogleOpenAIEndpoint(apiBaseUrl)) applyGoogleOpenAIOptions(body, model);
+    const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
       method: "POST",
+      signal,
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify({ ...body, stream: false }),
     });
-    if (!r.ok) throw new Error(`title ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
-    const raw = await r.text();
-    const d = parseMaybeSSE(raw);
+    const d = await auxiliaryResponse(r, model, false, "title", options);
     return d?.choices?.[0]?.message?.content ?? d?.choices?.[0]?.delta?.content ?? "";
   };
-  // Prefer structured output; many OpenAI-compatible/local servers reject
-  // `response_format`, so fall back to a plain text request on any failure.
+  // Retry plain output only when the optional structured format is unsupported.
   try {
     const content = await call({
       model,
@@ -352,8 +332,10 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
     });
     const t = parseTitle(content);
     if (t) return cleanTitle(t);
-  } catch {
-    // fall through to plain text
+    if (content.trim() && !/^[\[{]/.test(content.trim())) return cleanTitle(content);
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!(error instanceof ChatHTTPError) || ![400, 422].includes(error.status) || !/response_format|json_schema|structured|schema/i.test(error.message)) throw error;
   }
   const content = await call({ model, messages: msgs, max_tokens: 200, temperature: 0.3 });
   return cleanTitle(parseTitle(content) || content);
@@ -368,6 +350,7 @@ function parseMaybeSSE(raw: string): any {
   // SSE: concatenate delta content from each chunk, or use the last full message.
   let content = "";
   let last: any;
+  let usage: any;
   for (const line of trimmed.split("\n")) {
     const m = line.trim();
     if (!m.startsWith("data:")) continue;
@@ -376,13 +359,15 @@ function parseMaybeSSE(raw: string): any {
     try {
       const c = JSON.parse(payload);
       last = c;
+      if (c.usage) usage = c.usage;
       const delta = c?.choices?.[0]?.delta?.content;
       if (delta) content += delta;
     } catch {
       /* skip */
     }
   }
-  if (content) return { choices: [{ message: { content } }] };
+  if (content) return { choices: [{ message: { content } }], ...(usage ? { usage } : {}), ...(last?.error ? { error: last.error } : {}) };
+  if (last && usage) last.usage = usage;
   return last ?? {};
 }
 
@@ -400,49 +385,54 @@ function parseTitle(content: string): string {
 }
 
 /** Auto mode judge: pick the best-suited model id from candidates for a task. */
-export async function pickModel(apiBaseUrl: string, apiKey: string, judge: string, candidates: string[], task: string, anthropic?: boolean, oauthKind?: OAuthKind): Promise<string> {
+export async function pickModel(apiBaseUrl: string, apiKey: string, judge: string, candidates: string[], task: string, anthropic?: boolean, oauthKind?: OAuthKind, options?: AuxiliaryRequestOptions): Promise<string> {
+  const signal = auxiliarySignal(options);
+  signal.throwIfAborted();
   const useAnthropic = anthropic ?? isAnthropic(apiBaseUrl);
   const sys = `You route a coding task to the best model. Available models: ${candidates.join(", ")}. Reply with EXACTLY one model id from the list, nothing else.`;
   const prompt = task.slice(0, 2000);
-  if (oauthKind) {
-    // OAuth judges (Claude Code / Codex) have no raw HTTP endpoint; stream a tiny completion.
+  const responses = shouldUseOpenAIResponses({ apiBaseUrl, model: judge, anthropic, oauthKind });
+  const claude = oauthKind === "claude-code" || (!oauthKind && useAnthropic && ANTHROPIC_DEFAULT_THINKING.test(judge));
+  const google = !oauthKind && isGoogleOpenAIEndpoint(apiBaseUrl) && /^gemini-/i.test(judge);
+  if (oauthKind || responses || claude || google) {
+    // Use the provider's transport, with room for required reasoning tokens.
     let text = "";
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30_000);
-    try {
-      const gen = streamOAuthChat(oauthKind, {
-        model: judge,
-        messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
-        maxTokens: 64,
-        signal: ctrl.signal,
-      });
-      for await (const ev of gen) {
-        if (ev.type === "text-delta") text += ev.text;
-      }
-    } finally {
-      clearTimeout(timer);
+    const gen = streamChat({
+      apiBaseUrl, apiKey, anthropic, oauthKind, maxRetries: 1,
+      model: judge,
+      messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+      maxTokens: responses || claude || google ? 4096 : 64,
+      ...(responses || claude || google ? { modelParams: { reasoningEffort: google ? "none" : "low", ...(claude ? { thinking: "disabled" } : {}) } } : {}),
+      signal,
+    });
+    for await (const ev of gen) {
+      if (ev.type === "text-delta") text += ev.text;
+      if (ev.type === "usage") options?.onUsage?.(ev);
     }
     // Reasoning models may emit <think> blocks; last non-empty line is the answer.
     const lines = text.replace(/<think>[\s\S]*?<\/think>/gi, "").split("\n").map((l) => l.trim()).filter(Boolean);
     return lines.length ? lines[lines.length - 1] : text.trim();
   }
   if (useAnthropic) {
-    const r = await fetch(`${apiBaseUrl}/messages`, {
+    const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/messages`, {
       method: "POST",
+      signal,
       headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
       body: JSON.stringify({ model: judge, system: sys, messages: [{ role: "user", content: prompt }], max_tokens: 24 }),
     });
-    if (!r.ok) throw new Error(`judge ${r.status}`);
-    const d: any = await r.json();
-    return String(d?.content?.[0]?.text ?? "").trim();
+    const d = await auxiliaryResponse(r, judge, true, "judge", options);
+    return (d?.content ?? []).filter((block: any) => block?.type === "text").map((block: any) => block.text ?? "").join("").trim();
   }
-  const r = await fetch(`${apiBaseUrl}/chat/completions`, {
+  const body: Record<string, unknown> = { model: judge, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }], max_tokens: 24, temperature: 0 };
+  applyOpenAIChatOptions(body, apiBaseUrl, judge, { auxiliary: true });
+  if (isGoogleOpenAIEndpoint(apiBaseUrl)) applyGoogleOpenAIOptions(body, judge);
+  const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
     method: "POST",
+    signal,
     headers: { ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}), "content-type": "application/json" },
-    body: JSON.stringify({ model: judge, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }], max_tokens: 24, temperature: 0 }),
+    body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`judge ${r.status}`);
-  const d: any = await r.json();
+  const d = await auxiliaryResponse(r, judge, false, "judge", options);
   return String(d?.choices?.[0]?.message?.content ?? "").trim();
 }
 
@@ -459,22 +449,42 @@ function cleanTitle(s: string): string {
 /** Public entry: streams a chat completion with transient-error retry. */
 export function streamChat(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
   if (opts.oauthKind) {
-    const make = () => streamOAuthChat(opts.oauthKind!, { model: opts.model, messages: opts.messages, tools: opts.tools, maxTokens: opts.maxTokens, modelParams: opts.modelParams, signal: opts.signal });
-    return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3);
+    const make = () => streamOAuthChat(opts.oauthKind!, { model: opts.model, messages: opts.messages, tools: opts.tools, maxTokens: opts.maxTokens, modelParams: opts.modelParams, sampling: opts.sampling, temperature: opts.temperature, promptCacheKey: opts.promptCacheKey, signal: opts.signal });
+    return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3, opts.model);
   }
   const useAnthropic = opts.anthropic ?? isAnthropic(opts.apiBaseUrl);
   if (useAnthropic && !opts.apiKey) {
     throw new Error("API Key not set");
   }
-  const make = () => (useAnthropic ? streamAnthropic(opts) : streamOpenAI(opts));
-  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3);
+  const make = () => (useAnthropic ? streamAnthropic(opts) : shouldUseOpenAIResponses(opts) ? streamResponses(opts) : streamOpenAI(opts));
+  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 10, opts.model);
 }
 
+async function* streamResponses(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
+  try {
+    const { url, init } = createOpenAIResponsesRequest(opts);
+    const response = await fetch(url, init);
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new ChatHTTPError(response.status, `OpenAI Responses ${response.status}: ${detail.slice(0, 500)}`);
+    }
+    yield* parseOpenAIResponses(response, opts.signal, opts.model);
+  } catch (error) {
+    if (error instanceof OpenAIResponsesError) throw new ChatHTTPError(error.status, error.message);
+    throw error;
+  }
+}
+
+const withoutStreamUsage = new Set<string>();
+
 async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
+  const baseUrl = normalizeBaseUrl(opts.apiBaseUrl);
+  const google = isGoogleOpenAIEndpoint(baseUrl);
   const body: Record<string, unknown> = {
     model: opts.model,
-    messages: normalizeOpenAIMessages(opts.messages),
+    messages: normalizeOpenAIMessages(opts.messages, google ? opts.model : undefined),
     stream: true,
+    ...(!withoutStreamUsage.has(baseUrl) ? { stream_options: { include_usage: true } } : {}),
   };
   // Only send temperature when explicitly requested (title gen etc.);
   // otherwise let the provider use its own default.
@@ -487,12 +497,14 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     body.reasoning_effort = opts.modelParams.reasoningEffort;
   }
   applyOpenAISampling(body, opts.sampling);
+  applyOpenAIChatOptions(body, opts.apiBaseUrl, opts.model);
+  if (google) applyGoogleOpenAIOptions(body, opts.model, opts.modelParams);
   if (opts.tools?.length) {
     body.tools = opts.tools;
     body.tool_choice = "auto";
   }
 
-  const r = await fetch(`${opts.apiBaseUrl}/chat/completions`, {
+  const request = () => fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
@@ -501,29 +513,37 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     body: JSON.stringify(body),
     signal: opts.signal,
   });
+  let r = await request();
+  if (body.stream_options && (r.status === 400 || r.status === 422)) {
+    const detail = await r.clone().text();
+    // Retry only a provider's explicit rejection of the optional usage field.
+    // Do not replay requests rejected for model, credentials or context limits.
+    if (/stream_options|include_usage/i.test(detail) && /unsupported|unknown|unrecognized|not (?:allowed|supported|permitted)|extra|unexpected/i.test(detail)) {
+      await r.body?.cancel();
+      delete body.stream_options;
+      withoutStreamUsage.add(baseUrl);
+      r = await request();
+    }
+  }
   if (!r.ok || !r.body) {
     const detail = await r.text().catch(() => "");
-    throw new ChatHTTPError(r.status, `chat ${r.status}: ${detail.slice(0, 500)}`);
+    // Strip HTML wrappers from providers (e.g. openresty) that embed errors in <html> tags.
+    const clean = detail.replace(/<html[\s\S]*<\/html>/gi, "").trim() || detail;
+    const hint = r.status === 404 && /xiaomimimo\.com/i.test(opts.apiBaseUrl)
+      ? " (MIMO: verify your Base URL and API Key at https://platform.xiaomimimo.com)"
+      : "";
+    throw new ChatHTTPError(r.status, `chat ${r.status}${hint}: ${clean.slice(0, 500)}`);
   }
 
-  const toolAcc: Record<number, { id: string; name: string; args: string }> = {};
+  const toolAcc: Record<number, { id: string; name: string; args: string; thoughtSignature?: string }> = {};
   let finishReason = "stop";
+  let finished = false;
+  const usage = new UsageTracker();
 
   const reader = r.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
-      if (data === "[DONE]") continue;
+  for await (const data of sseData(reader)) {
+      if (data === "[DONE]") { finished = true; break; }
       let chunk: any;
       try {
         chunk = JSON.parse(data);
@@ -532,8 +552,10 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
       }
 
       if (chunk.usage) {
-        yield { type: "usage", promptTokens: chunk.usage.prompt_tokens, completionTokens: chunk.usage.completion_tokens };
+        const event = usage.update(chunk.usage.prompt_tokens, chunk.usage.completion_tokens, chunk.usage.prompt_tokens_details?.cached_tokens);
+        if (event) yield event;
       }
+      if (chunk.error) throw new ChatHTTPError(Number(chunk.error.status ?? chunk.error.code) || 502, `chat stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`);
       const choice = chunk.choices?.[0];
       if (!choice) continue;
       const delta = choice.delta ?? {};
@@ -547,6 +569,8 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
         for (const tc of delta.tool_calls) {
           const idx = tc.index ?? 0;
           const acc = (toolAcc[idx] ??= { id: "", name: "", args: "" });
+          const signature = google ? googleThoughtSignature(tc) : undefined;
+          if (signature) acc.thoughtSignature = signature;
           if (tc.id) acc.id = tc.id;
           const hadName = !!acc.name;
           if (tc.function?.name) acc.name = tc.function.name;
@@ -559,120 +583,27 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
           }
         }
       }
-      if (choice.finish_reason) finishReason = choice.finish_reason;
-    }
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason;
+        finished = true;
+        if (finishReason === "error" || finishReason === "content_filter") throw new ChatHTTPError(400, `chat stream ended with ${finishReason}`);
+      }
   }
 
+  if (!finished) throw new ChatHTTPError(502, "chat stream ended before completion");
   for (const idx of Object.keys(toolAcc).map(Number).sort((a, b) => a - b)) {
     const a = toolAcc[idx];
     if (!a.name) continue;
     // Some providers prefix tool names (e.g. "default_api:read_file" or "functions.read_file"); normalize.
     const normalizedName = a.name.split(/[:.]/).pop() || a.name;
-    const call: ToolCall = { id: a.id || `call_${idx}`, name: normalizedName, arguments: a.args || "{}" };
+    const call: ToolCall = { id: a.id || `call_${idx}`, name: normalizedName, arguments: a.args || "{}",
+      ...(a.thoughtSignature ? { thoughtSignature: a.thoughtSignature } : {}) };
     yield { type: "tool-call", call };
   }
   yield { type: "done", finishReason };
 }
 
 // ---- Anthropic Messages API ----
-
-interface AnthropicBlock {
-  type: "text" | "tool_use" | "tool_result" | "image";
-  text?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-  tool_use_id?: string;
-  content?: string | AnthropicBlock[];
-  source?: { type: "base64"; media_type: string; data: string };
-  cache_control?: { type: "ephemeral" };
-}
-
-interface AnthropicMessage {
-  role: "user" | "assistant";
-  content: string | AnthropicBlock[];
-}
-
-function systemToBlocks(content: string | WireContentPart[]): AnthropicBlock[] {
-  if (typeof content === "string") {
-    return [{ type: "text", text: content }];
-  }
-  return content
-    .filter((p): p is Extract<typeof p, { type: "text" }> => p.type === "text")
-    .map((p) => ({ type: "text", text: p.text, ...(p.cache_control ? { cache_control: p.cache_control } : {}) }));
-}
-
-function toAnthropic(messages: WireMessage[]): { system: AnthropicBlock[]; messages: AnthropicMessage[] } {
-  const system: AnthropicBlock[] = [];
-  const out: AnthropicMessage[] = [];
-
-  for (const m of messages) {
-    if (m.role === "system") {
-      system.push(...systemToBlocks(m.content));
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") {
-        out.push({ role: "user", content: m.content });
-      } else {
-        const blocks: AnthropicBlock[] = [];
-        for (const part of m.content) {
-          if (part.type === "text") {
-            blocks.push({ type: "text", text: part.text, ...(part.cache_control ? { cache_control: part.cache_control } : {}) });
-          } else if (part.type === "image_url") {
-            const url = part.image_url.url;
-            const match = url.match(/^data:([^;]+);base64,(.*)$/);
-            if (match) {
-              blocks.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
-            }
-          }
-        }
-        out.push({ role: "user", content: blocks });
-      }
-    } else if (m.role === "assistant") {
-      const blocks: AnthropicBlock[] = [];
-      if (m.content) {
-        blocks.push({ type: "text", text: m.content });
-      }
-      if (m.tool_calls) {
-        for (const tc of m.tool_calls) {
-          let input: unknown = {};
-          try {
-            input = JSON.parse(tc.function.arguments || "{}");
-          } catch {
-            // leave as empty object
-          }
-          blocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
-        }
-      }
-      out.push({ role: "assistant", content: blocks.length ? blocks : "" });
-    } else if (m.role === "tool") {
-      // tool result -> a user message with a tool_result block; merge consecutive.
-      // Array content (text + image) becomes a tool_result with nested blocks.
-      let content: string | AnthropicBlock[];
-      if (Array.isArray(m.content)) {
-        const nested: AnthropicBlock[] = [];
-        for (const part of m.content) {
-          if (part.type === "text") {
-            nested.push({ type: "text", text: part.text });
-          } else if (part.type === "image_url") {
-            const match = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-            if (match) nested.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
-          }
-        }
-        content = nested;
-      } else {
-        content = m.content;
-      }
-      const block: AnthropicBlock = { type: "tool_result", tool_use_id: m.tool_call_id, content };
-      const last = out[out.length - 1];
-      if (last && last.role === "user" && Array.isArray(last.content)) {
-        last.content.push(block);
-      } else {
-        out.push({ role: "user", content: [block] });
-      }
-    }
-  }
-  return { system, messages: out };
-}
 
 async function* streamAnthropic(opts: {
   apiBaseUrl: string;
@@ -711,13 +642,12 @@ async function* streamAnthropic(opts: {
     }));
   }
 
-  // 1M context is native on Opus 5 / Fable 5 / Sonnet 5 / 4.6+; beta is only
-  // needed for older models that still gate long context behind it.
+  // Current 1M models use that window natively; the legacy beta is retired.
   const betas: string[] = [...reasoningBetas];
   if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
     betas.push("context-1m-2025-08-07");
   }
-  const r = await fetch(`${opts.apiBaseUrl}/messages`, {
+  const r = await fetch(`${normalizeBaseUrl(opts.apiBaseUrl)}/messages`, {
     method: "POST",
     headers: {
       "x-api-key": opts.apiKey,
@@ -734,22 +664,13 @@ async function* streamAnthropic(opts: {
   }
 
   const reader = r.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
   let finishReason = "stop";
+  let finished = false;
+  const usageTracker = new AnthropicUsageTracker();
 
   const toolBlocks: Record<number, { id: string; name: string; args: string }> = {};
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
+  for await (const data of sseData(reader)) {
       if (!data || data === "[DONE]") continue;
       let chunk: any;
       try {
@@ -784,16 +705,18 @@ async function* streamAnthropic(opts: {
           }
         }
       } else if (chunk.type === "message_delta") {
-        if (chunk.delta?.stop_reason) finishReason = chunk.delta.stop_reason;
-        if (chunk.usage) {
-          yield { type: "usage", promptTokens: chunk.usage.input_tokens, completionTokens: chunk.usage.output_tokens };
-        }
+        if (chunk.delta?.stop_reason) { finishReason = chunk.delta.stop_reason; finished = true; }
+        const usage = usageTracker.update(chunk.usage);
+        if (usage) yield usage;
+      } else if (chunk.type === "message_stop") {
+        finished = true;
       } else if (chunk.type === "message_start" && chunk.message?.usage) {
-        yield { type: "usage", promptTokens: chunk.message.usage.input_tokens, completionTokens: chunk.message.usage.output_tokens };
+        const usage = usageTracker.update(chunk.message.usage);
+        if (usage) yield usage;
       }
-    }
   }
 
+  if (!finished) throw new ChatHTTPError(502, "anthropic stream ended before completion");
   for (const idx of Object.keys(toolBlocks).map(Number).sort((a, b) => a - b)) {
     const a = toolBlocks[idx];
     if (!a.name) continue;

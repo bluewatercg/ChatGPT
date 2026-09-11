@@ -10,9 +10,10 @@
 import * as React from "react";
 import { Icon, IconName } from "../shared/icons";
 import { vscode } from "../shared/vscode";
-import { ApprovalActionType, ApprovalMode, ApprovalPolicy, DEFAULT_APPROVAL, EMPTY_FEATURES, FeatureConfig, LlamacppStatus, McpStatus, ModelDef, ModelUsage, OAUTH_LABEL, OAuthStatus, OllamaModel, OllamaStatus, Persona, RuleInfo, SkillInfo } from "./features";
+import { ApprovalActionType, ApprovalMode, ApprovalPolicy, DEFAULT_APPROVAL, EMPTY_FEATURES, FeatureConfig, LlamacppStatus, McpStatus, ModelDef, ModelUsage, OAUTH_LABEL, OAuthStatus, OllamaModel, OllamaStatus, Persona, RuleInfo, SkillInfo, uid } from "./features";
 import { HooksPanel, LlamacppPanel, McpPanel, ModelsPanel, OAuthAccountCard, OllamaPanel, PersonasPanel, ProvidersPanel, RulesPanel, SubagentsPanel } from "./FeaturePanels";
 import { ModelSelect } from "../shared/ModelSelect";
+import { CacheUsage } from "./CacheUsage";
 
 interface Settings {
   model: string;
@@ -315,6 +316,45 @@ function UsagePanel({
   features: FeatureConfig;
   setFeatures: (p: Partial<FeatureConfig>) => void;
 }) {
+  const [pending, setPending] = React.useState<"refresh" | "reset">();
+  const [notice, setNotice] = React.useState<{ text: string; error?: boolean }>();
+  const [quotaRefresh, setQuotaRefresh] = React.useState(0);
+  const actionRef = React.useRef<{ requestId: string; action: "refresh" | "reset"; timer: number } | undefined>(undefined);
+  React.useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      const message = event.data;
+      const active = actionRef.current;
+      if (message?.type !== "usageActionResult" || !active || message.requestId !== active.requestId || message.action !== active.action) return;
+      if (!["success", "cancelled", "error"].includes(message.status)) return;
+      window.clearTimeout(active.timer);
+      actionRef.current = undefined;
+      setPending(undefined);
+      setNotice(message.status === "error"
+        ? { text: message.error || "The usage action failed. Try again.", error: true }
+        : { text: message.status === "cancelled" ? "Usage reset cancelled." : active.action === "reset" ? "Recorded usage reset." : "Local usage refreshed. Account quota results are shown below." });
+    };
+    window.addEventListener("message", handler);
+    return () => {
+      window.removeEventListener("message", handler);
+      if (actionRef.current) window.clearTimeout(actionRef.current.timer);
+      actionRef.current = undefined;
+    };
+  }, []);
+  const runAction = (action: "refresh" | "reset") => {
+    if (actionRef.current) return;
+    const requestId = uid("usage");
+    const timer = window.setTimeout(() => {
+      if (actionRef.current?.requestId !== requestId) return;
+      actionRef.current = undefined;
+      setPending(undefined);
+      setNotice({ text: "No response received. Refresh to check the current usage before trying again.", error: true });
+    }, 30_000);
+    actionRef.current = { requestId, action, timer };
+    setPending(action);
+    setNotice(undefined);
+    if (action === "refresh") setQuotaRefresh(value => value + 1);
+    vscode.postMessage({ type: action === "refresh" ? "getUsage" : "resetUsage", requestId });
+  };
   const rows = Object.entries(usage).sort((a, b) => b[1].lastUsed - a[1].lastUsed);
   const totals = rows.reduce(
     (t, [, u]) => ({ p: t.p + u.promptTokens, c: t.c + u.completionTokens, r: t.r + u.requests }),
@@ -329,7 +369,7 @@ function UsagePanel({
       <div className="index-card">
         <div className="index-card-title">Total</div>
         <p className="row-desc">
-          {fmtTokens(totals.p)} input · {fmtTokens(totals.c)} output tokens across {totals.r} request{totals.r === 1 ? "" : "s"}. Tracked locally on this machine.
+          {fmtTokens(totals.p)} input · {fmtTokens(totals.c)} output tokens across {totals.r} request attempt{totals.r === 1 ? "" : "s"} with reported usage. Includes billed retries. Tracked locally on this machine.
         </p>
         {rows.length === 0 ? (
           <div className="empty-card" style={{ marginTop: 12 }}>No usage recorded yet. Start chatting to see per-model token usage.</div>
@@ -345,6 +385,7 @@ function UsagePanel({
                       {fmtTokens(u.promptTokens)} in · {fmtTokens(u.completionTokens)} out · {u.requests} req
                     </span>
                   </div>
+                  <div className="row-desc" style={{ marginBottom: 4 }}><CacheUsage usage={u} /></div>
                   <div className="index-bar"><div className="index-bar-fill" style={{ width: `${Math.max(2, Math.round((total / max) * 100))}%` }} /></div>
                 </div>
               );
@@ -352,17 +393,18 @@ function UsagePanel({
           </div>
         )}
         <div className="index-actions">
-          <button className="btn-secondary" onClick={() => vscode.postMessage({ type: "getUsage" })}>
-            <Icon name="reset" /> Refresh
+          <button className="btn-secondary" disabled={!!pending} onClick={() => runAction("refresh")}>
+            <Icon name="reset" /> {pending === "refresh" ? "Refreshing…" : "Refresh"}
           </button>
           <button
             className="btn-secondary danger"
-            disabled={rows.length === 0}
-            onClick={() => { if (confirm("Reset all recorded token usage?")) vscode.postMessage({ type: "resetUsage" }); }}
+            disabled={rows.length === 0 || !!pending}
+            onClick={() => runAction("reset")}
           >
-            <Icon name="trash" /> Reset Usage
+            <Icon name="trash" /> {pending === "reset" ? "Awaiting reset…" : "Reset Usage"}
           </button>
         </div>
+        {notice && <p className="row-desc" role={notice.error ? "alert" : "status"}>{notice.text}</p>}
       </div>
 
       <Group>
@@ -378,7 +420,7 @@ function UsagePanel({
           No OAuth accounts connected. Add one in the <strong>Providers → OAuth Accounts</strong> tab to see its quota here.
         </div>
       ) : (
-        oauthStatus.accounts.map((a) => <OAuthAccountCard key={a.id} account={a} defaultOpen />)
+        oauthStatus.accounts.map((a) => <OAuthAccountCard key={a.id} account={a} defaultOpen refreshToken={quotaRefresh} />)
       )}
     </>
   );

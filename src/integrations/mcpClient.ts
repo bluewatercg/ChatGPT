@@ -72,6 +72,10 @@ export class McpConnection {
       shell: useShell,
     });
     this.proc = proc;
+    proc.stdin.on("error", (error) => {
+      this.lastError = error.message;
+      for (const { reject } of this.pending.values()) reject(error);
+    });
 
     // Keep the last stderr lines so a startup failure surfaces a real reason
     // instead of just "MCP server closed".
@@ -94,19 +98,14 @@ export class McpConnection {
       this.pending.clear();
     });
 
-    const withTimeout = <T>(p: Promise<T>): Promise<T> =>
-      Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error("MCP timeout")), timeoutMs))]);
-
-    await withTimeout(
-      this._request("initialize", {
+    await this._request("initialize", {
         protocolVersion: "2024-11-05",
         capabilities: {},
         clientInfo: { name: "ocursor", version: "1.0.0" },
-      })
-    );
+      }, undefined, timeoutMs);
     this._notify("notifications/initialized", {});
 
-    const toolList = await withTimeout(this._request("tools/list", {}));
+    const toolList = await this._request("tools/list", {}, undefined, timeoutMs);
     this.tools = (toolList?.tools ?? []).map((t: any) => ({
       name: t.name,
       description: t.description,
@@ -115,20 +114,21 @@ export class McpConnection {
     this.connected = true;
   }
 
-  async callTool(name: string, args: any): Promise<string> {
-    const res = await this._request("tools/call", { name, arguments: args ?? {} });
+  async callTool(name: string, args: any, signal?: AbortSignal): Promise<string> {
+    const res = await this._request("tools/call", { name, arguments: args ?? {} }, signal);
     const content = res?.content;
     if (Array.isArray(content)) {
-      return content
+      const output = content
         .map((c: any) => (c.type === "text" ? c.text : JSON.stringify(c)))
         .join("\n");
+      return res.isError ? `error: ${output}` : output;
     }
     return JSON.stringify(res ?? {});
   }
 
   /** List resources exposed by this server (resources/list). */
-  async listResources(): Promise<{ uri: string; name?: string; description?: string; mimeType?: string }[]> {
-    const res = await this._request("resources/list", {});
+  async listResources(signal?: AbortSignal): Promise<{ uri: string; name?: string; description?: string; mimeType?: string }[]> {
+    const res = await this._request("resources/list", {}, signal);
     return (res?.resources ?? []).map((r: any) => ({
       uri: r.uri,
       name: r.name,
@@ -138,8 +138,8 @@ export class McpConnection {
   }
 
   /** Read a resource (resources/read); returns its text contents joined. */
-  async readResource(uri: string): Promise<string> {
-    const res = await this._request("resources/read", { uri });
+  async readResource(uri: string, signal?: AbortSignal): Promise<string> {
+    const res = await this._request("resources/read", { uri }, signal);
     const contents = res?.contents;
     if (Array.isArray(contents)) {
       return contents
@@ -150,7 +150,10 @@ export class McpConnection {
   }
 
   dispose() {
+    for (const { reject } of this.pending.values()) reject(new Error("MCP connection closed"));
+    this.pending.clear();
     this.proc?.kill();
+    this.proc = undefined;
     this.connected = false;
   }
 
@@ -181,36 +184,75 @@ export class McpConnection {
     }
   }
 
-  private _request(method: string, params: any): Promise<any> {
+  private _request(method: string, params: any, signal?: AbortSignal, timeoutMs = 300_000): Promise<any> {
+    if (signal?.aborted) return Promise.reject(new Error("aborted: MCP request"));
+    if (!this.proc || this.proc.stdin.destroyed) return Promise.reject(new Error("MCP connection is closed"));
     const id = this.nextId++;
     const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.proc?.stdin.write(payload);
+      let settled = false;
+      const finish = (error?: Error, value?: any) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        this.pending.delete(id);
+        if (error) reject(error); else resolve(value);
+      };
+      const cancel = (reason: string) => {
+        if (settled) return;
+        // MCP cancellation is advisory: the server may already have committed
+        // an action. Never imply that settling the local promise rolls it back.
+        if (method !== "initialize") this._notify("notifications/cancelled", { requestId: id, reason });
+        finish(new Error(`${reason}; server cancellation is best effort`));
+      };
+      const onAbort = () => cancel("aborted: MCP request");
+      const timer = setTimeout(() => cancel(`timeout: MCP ${method}`), timeoutMs);
+      this.pending.set(id, { resolve: (value) => finish(undefined, value), reject: (error) => finish(error) });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        this.proc!.stdin.write(payload, (error) => { if (error) finish(error); });
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
   private _notify(method: string, params: any) {
     const payload = JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n";
-    this.proc?.stdin.write(payload);
+    try {
+      if (!this.proc?.stdin.destroyed) this.proc?.stdin.write(payload, () => { /* close handler settles requests */ });
+    } catch { /* cancellation notifications are best effort */ }
   }
 }
 
 /** Manages all configured MCP connections. */
 export class McpManager {
   private connections = new Map<string, McpConnection>();
+  private syncing: Promise<void> = Promise.resolve();
+  private generation = 0;
 
-  async sync(configs: McpServerConfig[]): Promise<void> {
+  sync(configs: McpServerConfig[]): Promise<void> {
+    const snapshot = structuredClone(configs);
+    const generation = this.generation;
+    const next = this.syncing.catch(() => {}).then(() => this.applyConfigs(snapshot, generation));
+    this.syncing = next;
+    return next;
+  }
+
+  private async applyConfigs(configs: McpServerConfig[], generation: number): Promise<void> {
+    if (generation !== this.generation) return;
     // Dispose connections no longer present or disabled.
     for (const [name, conn] of this.connections) {
       const cfg = configs.find((c) => c.name === name);
-      if (!cfg || !cfg.enabled) {
+      if (!cfg || !cfg.enabled || !conn.connected || JSON.stringify(cfg) !== JSON.stringify(conn.config)) {
         conn.dispose();
         this.connections.delete(name);
       }
     }
     // Connect new enabled servers.
     for (const cfg of configs) {
+      if (generation !== this.generation) return;
       if (!cfg.enabled || this.connections.has(cfg.name)) {
         continue;
       }
@@ -220,6 +262,7 @@ export class McpManager {
         await conn.connect();
       } catch (e) {
         conn.lastError = e instanceof Error ? e.message : String(e);
+        conn.dispose();
       }
     }
   }
@@ -238,7 +281,7 @@ export class McpManager {
     return out;
   }
 
-  async callTool(qualifiedName: string, args: any): Promise<string> {
+  async callTool(qualifiedName: string, args: any, signal?: AbortSignal): Promise<string> {
     const m = qualifiedName.match(/^mcp__(.+?)__(.+)$/);
     if (!m) {
       return `error: invalid MCP tool name ${qualifiedName}`;
@@ -248,19 +291,20 @@ export class McpManager {
       return `error: MCP server ${m[1]} not connected`;
     }
     try {
-      return await conn.callTool(m[2], args);
+      return await conn.callTool(m[2], args, signal);
     } catch (e) {
       return `error: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
   /** List resources across all connected servers, namespaced by server. */
-  async listResources(): Promise<{ server: string; uri: string; name?: string; description?: string; mimeType?: string }[]> {
+  async listResources(signal?: AbortSignal): Promise<{ server: string; uri: string; name?: string; description?: string; mimeType?: string }[]> {
     const out: { server: string; uri: string; name?: string; description?: string; mimeType?: string }[] = [];
     for (const [name, conn] of this.connections) {
+      if (signal?.aborted) throw new Error("aborted: MCP resource listing");
       if (!conn.connected) continue;
       try {
-        for (const r of await conn.listResources()) out.push({ server: name, ...r });
+        for (const r of await conn.listResources(signal)) out.push({ server: name, ...r });
       } catch {
         /* server may not support resources */
       }
@@ -268,11 +312,11 @@ export class McpManager {
     return out;
   }
 
-  async readResource(server: string, uri: string): Promise<string> {
+  async readResource(server: string, uri: string, signal?: AbortSignal): Promise<string> {
     const conn = this.connections.get(server);
     if (!conn || !conn.connected) return `error: MCP server ${server} not connected`;
     try {
-      return await conn.readResource(uri);
+      return await conn.readResource(uri, signal);
     } catch (e) {
       return `error: ${e instanceof Error ? e.message : String(e)}`;
     }
@@ -287,6 +331,7 @@ export class McpManager {
   }
 
   disposeAll() {
+    this.generation++;
     for (const conn of this.connections.values()) {
       conn.dispose();
     }

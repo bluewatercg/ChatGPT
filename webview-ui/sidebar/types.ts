@@ -57,7 +57,7 @@ export interface ModelOption {
   value: string;
 }
 
-export type ModelKind = "openai" | "anthropic" | "google" | "openrouter" | "ollama" | "llamacpp" | "claude-code" | "codex" | "antigravity";
+export type ModelKind = "openai" | "anthropic" | "google" | "openrouter" | "ollama" | "llamacpp" | "mimo" | "atlascloud" | "astraflow" | "claude-code" | "codex" | "antigravity";
 
 export interface ModelDef {
   id: string;
@@ -102,16 +102,17 @@ export type InMessage =
   | { type: "modelsFetched"; models: string[]; modelList?: ModelDef[] }
   | { type: "modelSelected"; model: string }
   | { type: "conversations"; list: ConversationSummary[]; activeId?: string; runningConvIds?: string[] }
-  | { type: "loadConversation"; activeId?: string; turns: Turn[]; personaId?: string; usedTokens?: number }
-  | { type: "error"; message: string }
+  | { type: "loadConversation"; activeId?: string; turns: Turn[]; personaId?: string; usedTokens?: number; running?: boolean }
+  | { type: "error"; convId?: string; message: string }
   | { type: "attachmentsPicked"; attachments: Attachment[] }
   | { type: "fileSearchResults"; requestId: number; items: MentionItem[] }
   | { type: "mentionSearchResults"; requestId: number; kind: MentionCategory; items: MentionItem[] }
   | { type: "insertMention"; mention: MentionItem }
   | { type: "pasteResolved"; requestId: number; mention?: MentionItem }
   | { type: "pendingChanges"; changes: PendingChangeInfo[] }
-  | { type: "runStarted"; convId: string; prompt: string }
+  | { type: "runStarted"; convId: string; prompt: string; created?: boolean; turns?: Turn[] }
   | { type: "agentEvent"; convId: string; event: AgentEvent }
+  | { type: "questionAnswered"; convId: string; callId: string; answers: Record<string, string[]> }
   | { type: "approvalRequest"; convId: string; request: ApprovalRequestInfo }
   | { type: "approvalResolved"; convId: string; requestId: string; approved: boolean }
   | { type: "fileIcon"; filename: string; icon?: FileIconInfo };
@@ -139,7 +140,7 @@ export interface ApprovalRequestInfo {
 // webview -> extension
 export type OutMessage =
   | { type: "ready" }
-  | { type: "sendMessage"; text: string; attachments?: Attachment[]; fromIndex?: number; model?: string; mode?: Mode; revertFiles?: boolean }
+  | { type: "sendMessage"; convId?: string | null; text: string; attachments?: Attachment[]; fromIndex?: number; model?: string; mode?: Mode; revertFiles?: boolean }
   | { type: "continueRun"; always?: boolean }
   | { type: "revertToMessage"; index: number; revertFiles?: boolean }
   | { type: "browseAttachments" }

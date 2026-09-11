@@ -7,18 +7,29 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-import * as assert from 'assert';
+import * as assert from "assert";
+import * as vscode from "vscode";
 
-// You can import and use all API from the 'vscode' module
-// as well as import your extension to test it
-import * as vscode from 'vscode';
-// import * as myExtension from '../../extension';
+suite("Installed extension host integration", () => {
+  suiteSetup(async () => {
+    const extension = vscode.extensions.getExtension("pkrd.ocursor");
+    assert.ok(extension, "The extension under test must be installed in the development host");
+    await extension.activate();
+    assert.strictEqual(extension.isActive, true);
+  });
 
-suite('Extension Test Suite', () => {
-	vscode.window.showInformationMessage('Start all tests.');
+  test("activation registers the real chat/settings/review commands", async () => {
+    const commands = new Set(await vscode.commands.getCommands(true));
+    for (const command of ["ocursor.addToChat", "ocursor.openSettings", "ocursor.viewDiff"]) {
+      assert.ok(commands.has(command), `Missing registered command: ${command}`);
+    }
+    // Exercise the actual command handler: untracked paths must be a safe no-op.
+    await vscode.commands.executeCommand("ocursor.viewDiff", "not-a-pending-file.ts");
+  });
 
-	test('Sample test', () => {
-		assert.strictEqual(-1, [1, 2, 3].indexOf(5));
-		assert.strictEqual(-1, [1, 2, 3].indexOf(0));
-	});
+  test("activation installs a working original-document provider for review", async () => {
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.from({ scheme: "ocursor-inline-original", path: "/missing.ts" }));
+    assert.strictEqual(document.getText(), "");
+    assert.strictEqual(document.uri.scheme, "ocursor-inline-original");
+  });
 });

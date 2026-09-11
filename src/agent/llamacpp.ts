@@ -17,7 +17,7 @@
 //   server with model-swapping (`-hf` / slots) if RAM pressure matters.
 
 import * as fs from "fs/promises";
-import { createWriteStream } from "fs";
+import { createHash, randomUUID } from "crypto";
 import * as path from "path";
 import * as os from "os";
 import * as net from "net";
@@ -163,6 +163,7 @@ interface Running {
   port: number;
 }
 const running = new Map<string, Running>();
+const loadPromises = new Map<string, Promise<void>>();
 const loading = new Map<string, boolean>();
 const errors = new Map<string, string>();
 const logs = new Map<string, string[]>();
@@ -270,41 +271,62 @@ function modelId(repo: string | undefined, file: string): string {
 export async function downloadGguf(
   repo: string,
   file: string,
-  onProgress?: (received: number, total: number) => void
+  onProgress?: (received: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<LlamacppModel> {
   const dir = await ensureDir();
-  const url = `https://huggingface.co/${repo}/resolve/main/${file}`;
-  const dest = path.join(dir, path.basename(file));
-  const res = await fetch(url);
+  const url = `https://huggingface.co/${repo.split("/").map(encodeURIComponent).join("/")}/resolve/main/${file.split("/").map(encodeURIComponent).join("/")}`;
+  const identity = createHash("sha256").update(`${repo}/${file}`).digest("hex");
+  const dest = path.join(dir, identity, path.basename(file));
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  const temporary = `${dest}.${randomUUID()}.part`;
+  const res = await fetch(url, { signal });
   if (!res.ok || !res.body) throw new Error(`download ${res.status}`);
-  const total = Number(res.headers.get("content-length") || 0);
+  const total = res.headers.get("content-encoding") ? 0 : Number(res.headers.get("content-length") || 0);
   let received = 0;
-  const ws = createWriteStream(dest);
   const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    received += value.length;
-    onProgress?.(received, total);
-    await new Promise<void>((resolve, reject) =>
-      ws.write(value, (e) => (e ? reject(e) : resolve()))
-    );
+  async function* chunks() {
+    for (;;) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.length;
+      onProgress?.(received, total);
+      yield value;
+    }
   }
-  await new Promise<void>((resolve) => ws.end(resolve));
+  try {
+    await fs.writeFile(temporary, chunks(), { flag: "wx", signal });
+    signal?.throwIfAborted();
+    if (!received || (total > 0 && received !== total)) throw new Error(`incomplete GGUF download: received ${received} of ${total} bytes`);
+    await fs.rename(temporary, dest);
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+    await fs.rm(temporary, { force: true });
+  }
   const stat = await fs.stat(dest);
-  return makeModel({ repo, file: path.basename(file), filePath: dest, sizeBytes: stat.size, name: path.basename(file, ".gguf") });
+  return makeModel({ repo, file, filePath: dest, sizeBytes: stat.size, name: path.basename(file, ".gguf") });
 }
 
 /** Import an existing local .gguf file (copied into the models dir). */
 export async function importGguf(srcPath: string): Promise<LlamacppModel> {
   const dir = await ensureDir();
   const base = path.basename(srcPath);
-  const dest = path.join(dir, base);
+  const identity = createHash("sha256").update(await fs.realpath(srcPath)).digest("hex");
+  const dest = path.join(dir, identity, base);
+  await fs.mkdir(path.dirname(dest), { recursive: true });
   if (path.resolve(srcPath) !== path.resolve(dest)) {
-    await fs.copyFile(srcPath, dest);
+    const temporary = `${dest}.${randomUUID()}.part`;
+    try {
+      await fs.copyFile(srcPath, temporary);
+      await fs.rename(temporary, dest);
+    } finally {
+      await fs.rm(temporary, { force: true });
+    }
   }
   const stat = await fs.stat(dest);
-  return makeModel({ file: base, filePath: dest, sizeBytes: stat.size, name: path.basename(base, ".gguf") });
+  return { ...makeModel({ file: base, filePath: dest, sizeBytes: stat.size, name: path.basename(base, ".gguf") }), id: `import:${identity}/${base}` };
 }
 
 function makeModel(p: { repo?: string; file: string; filePath: string; sizeBytes?: number; name: string }): LlamacppModel {
@@ -396,7 +418,15 @@ function buildArgs(m: LlamacppModel, cfg: LlamacppServerConfig, port: number): s
 }
 
 // ---- load / unload ----
-export async function loadModel(m: LlamacppModel, globalCfg?: LlamacppServerConfig | number): Promise<void> {
+export function loadModel(m: LlamacppModel, globalCfg?: LlamacppServerConfig | number): Promise<void> {
+  const pending = loadPromises.get(m.id);
+  if (pending) return pending;
+  const promise = startModel(m, globalCfg).finally(() => loadPromises.delete(m.id));
+  loadPromises.set(m.id, promise);
+  return promise;
+}
+
+async function startModel(m: LlamacppModel, globalCfg?: LlamacppServerConfig | number): Promise<void> {
   if (running.has(m.id)) return;
   errors.delete(m.id);
   logs.set(m.id, []); // fresh log per load
@@ -451,12 +481,22 @@ function spawnServer(m: LlamacppModel, cfg: LlamacppServerConfig, host: string, 
 
   let resolved = false;
   return new Promise<void>((resolve, reject) => {
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    const healthAbort = new AbortController();
     const fail = (msg: string) => {
+      // Lifetime cleanup also applies after the startup promise has resolved.
+      const owned = running.get(m.id)?.proc === proc;
+      if (owned) {
+        running.delete(m.id);
+        loading.delete(m.id);
+        errors.set(m.id, msg);
+        appendLog(m.id, `[error] ${msg}`);
+        emit();
+      }
+      clearTimeout(pollTimer);
+      healthAbort.abort();
       if (resolved) return;
       resolved = true;
-      running.delete(m.id);
-      appendLog(m.id, `[error] ${msg}`);
-      emit();
       reject(new Error(msg));
     };
     proc.on("error", (e) => fail(e.message));
@@ -471,7 +511,8 @@ function spawnServer(m: LlamacppModel, cfg: LlamacppServerConfig, host: string, 
       if (resolved) return;
       if (!running.has(m.id)) return; // exited
       try {
-        const r = await fetch(healthUrl);
+        const r = await fetch(healthUrl, { signal: AbortSignal.any([healthAbort.signal, AbortSignal.timeout(5000)]) });
+        if (resolved || running.get(m.id)?.proc !== proc) return;
         if (r.ok) {
           resolved = true;
           loading.delete(m.id);
@@ -483,8 +524,13 @@ function spawnServer(m: LlamacppModel, cfg: LlamacppServerConfig, host: string, 
       } catch {
         // server not accepting connections yet — keep waiting
       }
-      if (Date.now() > deadline) return fail("timed out waiting for model to load");
-      setTimeout(poll, 500);
+      if (resolved) return;
+      if (Date.now() > deadline) {
+        fail("timed out waiting for model to load");
+        proc.kill();
+        return;
+      }
+      pollTimer = setTimeout(poll, 500);
     };
     poll();
   });
@@ -495,16 +541,15 @@ function spawnServer(m: LlamacppModel, cfg: LlamacppServerConfig, host: string, 
  * loaded; otherwise loads it (resolves once the HTTP listener is ready).
  */
 export async function ensureLoaded(m: LlamacppModel, globalCfg?: LlamacppServerConfig): Promise<void> {
-  if (running.has(m.id)) return;
   await loadModel(m, globalCfg);
 }
 
 export async function unloadModel(id: string): Promise<void> {
   const r = running.get(id);
   if (!r) return;
-  r.proc.kill();
   running.delete(id);
   loading.delete(id);
+  r.proc.kill();
   appendLog(id, "[stopped] server unloaded");
   emit();
 }

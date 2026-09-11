@@ -24,7 +24,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
-import { scanFiles } from "./tools/fileScan";
+import { scanFiles, isPathExcluded } from "./tools/fileScan";
 import { importRuntimeDep } from "../runtimeDeps";
 
 // Selectable local embedding models. Add entries here to offer more choices.
@@ -52,6 +52,14 @@ let remoteCfg: RemoteEmbedConfig | null = null;
 
 export function getEmbedModelId(): string {
   return remoteCfg ? remoteCfg.id : activeModel.id;
+}
+
+/** Version vector spaces by all settings that affect their meaning, without persisting credentials. */
+export function getEmbedFingerprint(): string {
+  const config = remoteCfg
+    ? { backend: "remote", model: remoteCfg.id, endpoint: remoteCfg.baseUrl.replace(/\/+$/, "") }
+    : { backend: "local", ...activeModel };
+  return crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 24);
 }
 
 /** Switch to a LOCAL embedding model. Invalidates the loaded extractor (re-index needed). */
@@ -147,6 +155,7 @@ export interface Chunk {
  * and makes the cosine scan a contiguous walk.
  */
 interface IndexData {
+  fingerprint: string;
   model: string;
   dim: number;
   files: Record<string, string>; // relPath -> mtime+size hash
@@ -156,7 +165,9 @@ interface IndexData {
 }
 
 interface MetaFile {
-  v: 2;
+  v: 3;
+  checksum: string;
+  fingerprint: string;
   model: string;
   dim: number;
   files: Record<string, string>;
@@ -267,6 +278,7 @@ async function embedRemote(texts: string[]): Promise<number[][] | null> {
   try {
     const res = await fetch(`${remoteCfg.baseUrl.replace(/\/$/, "")}/embeddings`, {
       method: "POST",
+      signal: AbortSignal.timeout(30_000),
       headers: { "content-type": "application/json", authorization: `Bearer ${remoteCfg.apiKey}` },
       body: JSON.stringify({ model: remoteCfg.id, input: texts }),
     });
@@ -316,7 +328,7 @@ function normRoot(root: string): string {
 
 function indexBase(root: string): string {
   const id = crypto.createHash("sha1").update(normRoot(root)).digest("hex").slice(0, 16);
-  const mid = getEmbedModelId().replace(/[^\w.-]+/g, "_");
+  const mid = getEmbedFingerprint();
   return path.join(storageDir!, `index-${id}-${mid}`);
 }
 function metaPath(root: string): string {
@@ -349,7 +361,7 @@ function activeDim(): number {
 }
 
 function emptyIndex(): IndexData {
-  return { model: getEmbedModelId(), dim: activeDim(), files: {}, metas: [], vecs: new Float32Array(0), count: 0 };
+  return { fingerprint: getEmbedFingerprint(), model: getEmbedModelId(), dim: activeDim(), files: {}, metas: [], vecs: new Float32Array(0), count: 0 };
 }
 
 /** Grow the packed matrix geometrically so pushes stay amortized O(1). */
@@ -403,7 +415,7 @@ async function readLegacyIndex(root: string): Promise<IndexData | null> {
     const raw = await fs.readFile(metaPath(root), "utf8");
     const parsed: any = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.chunks)) return null;
-    if (parsed.model !== getEmbedModelId()) return null;
+    if (parsed.fingerprint !== getEmbedFingerprint()) return null;
     const idx = emptyIndex();
     idx.files = parsed.files && typeof parsed.files === "object" ? parsed.files : {};
     reserve(idx, parsed.chunks.length);
@@ -419,19 +431,21 @@ async function readLegacyIndex(root: string): Promise<IndexData | null> {
 
 async function load(root: string): Promise<IndexData> {
   const key = normRoot(root);
-  if (memIndex && memRoot === key) return memIndex;
+  if (memIndex && memRoot === key && memIndex.fingerprint === getEmbedFingerprint()) return memIndex;
   memRoot = key;
   try {
     const raw = await fs.readFile(metaPath(root), "utf8");
     const meta = JSON.parse(raw) as MetaFile;
-    if (meta?.v === 2 && meta.model === getEmbedModelId() && Array.isArray(meta.metas)) {
+    if (meta?.v === 3 && meta.fingerprint === getEmbedFingerprint() && Array.isArray(meta.metas)) {
       const buf = await fs.readFile(vecPath(root));
+      if (crypto.createHash("sha256").update(buf).digest("hex") !== meta.checksum) throw new Error("Incomplete index snapshot");
       const dim = meta.dim || activeDim();
       const rows = dim ? Math.min(meta.metas.length, Math.floor(buf.byteLength / (dim * 4))) : 0;
       const vecs = new Float32Array(rows * dim);
       // Copy out of the Buffer: its byteOffset may be unaligned for Float32.
       Buffer.from(vecs.buffer).set(buf.subarray(0, rows * dim * 4));
       memIndex = {
+        fingerprint: meta.fingerprint,
         model: meta.model,
         dim,
         files: meta.files || {},
@@ -449,20 +463,31 @@ async function load(root: string): Promise<IndexData> {
 }
 
 async function save(root: string, idx: IndexData): Promise<void> {
-  if (!storageDir) return;
+  if (!storageDir || idx.fingerprint !== getEmbedFingerprint()) return;
   await fs.mkdir(storageDir, { recursive: true });
+  if (idx.fingerprint !== getEmbedFingerprint()) return;
+  const vectorDestination = vecPath(root), metadataDestination = metaPath(root);
+  const rows = idx.count * idx.dim;
+  const bytes = Buffer.from(idx.vecs.buffer, 0, rows * 4);
   const meta: MetaFile = {
-    v: 2,
+    v: 3,
+    checksum: crypto.createHash("sha256").update(bytes).digest("hex"),
+    fingerprint: idx.fingerprint,
     model: idx.model,
     dim: idx.dim,
     files: idx.files,
     metas: idx.metas.map((m) => [m.path, m.start, m.end]),
   };
-  const rows = idx.count * idx.dim;
-  await fs.writeFile(vecPath(root), Buffer.from(idx.vecs.buffer, 0, rows * 4));
-  await fs.writeFile(metaPath(root), JSON.stringify(meta), "utf8");
-  memIndex = idx;
-  memRoot = normRoot(root);
+  const suffix = `.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await fs.writeFile(vectorDestination + suffix, bytes);
+    await fs.writeFile(metadataDestination + suffix, JSON.stringify(meta), "utf8");
+    await fs.rename(vectorDestination + suffix, vectorDestination);
+    await fs.rename(metadataDestination + suffix, metadataDestination);
+  } finally {
+    await Promise.all([fs.rm(vectorDestination + suffix, { force: true }), fs.rm(metadataDestination + suffix, { force: true })]);
+  }
+  if (idx.fingerprint === getEmbedFingerprint()) { memIndex = idx; memRoot = normRoot(root); }
 }
 
 /** Load persisted index into memory (no embed work). Call on activate so status/UI show prior work. */
@@ -646,15 +671,19 @@ function isIndexableRel(rel: string): boolean {
  * which dominates build cost.
  */
 class BatchEmbedder {
-  private queue: { meta: Chunk; text: string }[] = [];
+  private queue: { meta: Chunk; text: string; file: { rel: string; hash: string; total: number; received: number; failed: boolean; chunks: { meta: Chunk; vec: number[] }[] } }[] = [];
   private chars = 0;
 
   constructor(private readonly idx: IndexData) {}
 
-  async add(meta: Chunk, text: string): Promise<void> {
-    this.queue.push({ meta, text });
-    this.chars += text.length;
-    if (this.queue.length >= EMBED_BATCH_TEXTS || this.chars >= EMBED_BATCH_CHARS) await this.flush();
+  async addFile(rel: string, hash: string, pieces: ReturnType<typeof chunkFile>): Promise<void> {
+    const file = { rel, hash, total: pieces.length, received: 0, failed: false, chunks: [] as { meta: Chunk; vec: number[] }[] };
+    if (!pieces.length) { dropPath(this.idx, rel); this.idx.files[rel] = hash; return; }
+    for (const piece of pieces) {
+      this.queue.push({ meta: { path: rel, start: piece.start, end: piece.end }, text: piece.text, file });
+      this.chars += piece.text.length;
+      if (this.queue.length >= EMBED_BATCH_TEXTS || this.chars >= EMBED_BATCH_CHARS) await this.flush();
+    }
   }
 
   async flush(): Promise<void> {
@@ -662,27 +691,40 @@ class BatchEmbedder {
     const batch = this.queue;
     this.queue = [];
     this.chars = 0;
-    const vecs = await embed(batch.map((b) => b.text));
-    if (!vecs) return;
+    const sameConfig = this.idx.fingerprint === getEmbedFingerprint();
+    const vecs = sameConfig && indexingEnabled ? await embed(batch.map((b) => b.text)).catch(() => null) : null;
+    const dim = this.idx.dim || vecs?.[0]?.length || 0;
+    const valid = !!vecs && vecs.length === batch.length && dim > 0 && this.idx.fingerprint === getEmbedFingerprint()
+      && vecs.every((v) => Array.isArray(v) && v.length === dim && v.every(Number.isFinite));
     for (let i = 0; i < batch.length; i++) {
-      const v = vecs[i];
-      if (v) pushChunk(this.idx, batch[i].meta, v);
+      const { file, meta } = batch[i];
+      file.received++;
+      if (!valid) file.failed = true;
+      else file.chunks.push({ meta, vec: vecs![i] });
+      if (file.received === file.total && !file.failed) {
+        // A file's old vectors and hash stay valid until every replacement chunk succeeds.
+        dropPath(this.idx, file.rel);
+        for (const chunk of file.chunks) pushChunk(this.idx, chunk.meta, chunk.vec);
+        this.idx.files[file.rel] = file.hash;
+      }
     }
   }
 }
 
 async function embedFileInto(embedder: BatchEmbedder, idx: IndexData, root: string, rel: string): Promise<boolean> {
+  if (!isIndexableRel(rel) || await isPathExcluded(root, rel)) {
+    dropPath(idx, rel);
+    delete idx.files[rel];
+    return false;
+  }
+  if (idx.fingerprint !== getEmbedFingerprint()) return false;
   const abs = path.join(root, rel);
   let st;
   try { st = await fs.stat(abs); } catch { return false; }
   if (st.size > MAX_FILE_BYTES) return false;
   let text: string;
   try { text = await fs.readFile(abs, "utf8"); } catch { return false; }
-  dropPath(idx, rel);
-  for (const p of chunkFile(text)) {
-    await embedder.add({ path: rel, start: p.start, end: p.end }, p.text);
-  }
-  idx.files[rel] = `${Math.round(st.mtimeMs)}:${st.size}`;
+  await embedder.addFile(rel, `${Math.round(st.mtimeMs)}:${st.size}`, chunkFile(text));
   return true;
 }
 
@@ -701,6 +743,7 @@ export async function upsertFile(root: string, absOrRel: string): Promise<void> 
   const abs = path.isAbsolute(absOrRel) ? absOrRel : path.join(root, absOrRel);
   const rel = path.relative(root, abs).split(path.sep).join("/");
   if (!rel || rel.startsWith("..") || !isIndexableRel(rel)) return;
+  if (await isPathExcluded(root, rel)) { await removeFile(root, rel); return; }
   const key = queueKey(root);
   if (indexing || drainRunning) {
     if (!pendingUpserts.has(key)) pendingUpserts.set(key, new Set());
@@ -797,7 +840,7 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
   try {
     const idx = await load(root);
     // Parallel scan + mtime/size in one pass (replaces serial walk + per-file stat).
-    const { files: scanned } = await scanFiles(root, {
+    const { files: scanned, truncated } = await scanFiles(root, {
       maxFiles: 100_000,
       timeMs: 60_000,
       useGitignore: true,
@@ -814,10 +857,10 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
       // Accept either rounded or raw mtime strings from older indexes.
       if (prev !== hash && prev !== `${f.mtimeMs}:${f.size}`) targets.push(rel);
     }
-    const changed = new Set(targets);
-    retainChunks(idx, (p) => seen.has(p) && !changed.has(p));
-    for (const rel of Object.keys(idx.files)) {
-      if (!seen.has(rel)) delete idx.files[rel];
+    // A bounded/partial scan cannot prove that an unseen file was deleted.
+    if (!truncated) {
+      retainChunks(idx, (p) => seen.has(p));
+      for (const rel of Object.keys(idx.files)) if (!seen.has(rel)) delete idx.files[rel];
     }
 
     // Nothing to do — still save cleaned deletions if any, emit status.
@@ -834,7 +877,7 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
     let lastSave = Date.now();
     let lastYield = Date.now();
     for (const rel of targets) {
-      if (!indexingEnabled) break;
+      if (!indexingEnabled || idx.fingerprint !== getEmbedFingerprint()) break;
       await embedFileInto(embedder, idx, root, rel);
       done++;
       progress = { done, total: targets.length };
@@ -871,6 +914,7 @@ async function hydrate(
   for (const h of hits) {
     if (!byFile.has(h.meta.path)) {
       try {
+        if (await isPathExcluded(root, h.meta.path)) { byFile.set(h.meta.path, null); continue; }
         const raw = await fs.readFile(path.join(root, h.meta.path), "utf8");
         byFile.set(h.meta.path, raw.split("\n"));
       } catch {
@@ -898,8 +942,9 @@ export async function search(
   k = 12,
   filter?: (rel: string) => boolean
 ): Promise<{ path: string; start: number; end: number; text: string; score: number }[]> {
+  const fingerprint = getEmbedFingerprint();
   const qv = await embedQuery(query);
-  if (!qv) return [];
+  if (!qv || fingerprint !== getEmbedFingerprint()) return [];
   const idx = await load(root);
   if (!idx.count || !idx.dim || qv.length !== idx.dim) return [];
   const dim = idx.dim;

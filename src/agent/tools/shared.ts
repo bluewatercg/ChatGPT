@@ -9,9 +9,14 @@
 
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as os from "os";
+import { randomUUID } from "crypto";
+import { createReadStream, createWriteStream, type WriteStream } from "fs";
 import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import type { SubagentRunner, QuestionAsker } from "./types";
+import type { ToolOutcome } from "../toolOutcome";
+import type { ContextReadInput } from "../contextArchive";
 
 // Directories never walked/listed (tools + indexing).
 export { IGNORE, BINARY_EXTS, NOISE_FILES, isNoisePath } from "./ignore";
@@ -43,6 +48,8 @@ export const TOOL_TIMEOUT_MS: Record<string, number> = {
   Shell: 120_000,
   AwaitShell: 300_000,
   Grep: 120_000,
+  Rg: 120_000,
+  Wait: 130_000,
   Glob: 120_000,
   FileSearch: 120_000,
   SemanticSearch: 300_000,
@@ -103,81 +110,30 @@ export function setToolTimeoutOverrides(sec: Record<string, number> | undefined)
  * Late resolve/reject of `p` is ignored (no unhandled rejection).
  */
 export function withToolTimeout<T>(
-  p: Promise<T>,
-  ms: number,
-  label: string,
-  onTimeout?: () => void,
-  signal?: AbortSignal,
+  p: Promise<T>, ms: number, label: string, onTimeout?: () => void, signal?: AbortSignal,
 ): Promise<T> {
-  // ms <= 0: no outer race (AskQuestion manages its own lifetime) — still honor abort.
-  if (!ms || ms <= 0) {
-    if (!signal) {
-      return Promise.resolve(p).catch((e) => {
-        throw e instanceof Error ? e : new Error(String(e));
-      });
-    }
-    return new Promise<T>((resolve, reject) => {
-      if (signal.aborted) {
-        reject(new Error(`aborted: ${label}`));
-        return;
-      }
-      let settled = false;
-      const onAbort = () => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", onAbort);
-        try { onTimeout?.(); } catch { /* ignore */ }
-        reject(new Error(`aborted: ${label}`));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      Promise.resolve(p).then(
-        (v) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener("abort", onAbort);
-          resolve(v);
-        },
-        (e) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener("abort", onAbort);
-          reject(e instanceof Error ? e : new Error(String(e)));
-        },
-      );
-    });
-  }
-  const limit = ms;
   return new Promise<T>((resolve, reject) => {
-    if (signal?.aborted) {
-      try { onTimeout?.(); } catch { /* ignore */ }
-      reject(new Error(`aborted: ${label}`));
-      return;
-    }
     let settled = false;
-    const done = (fn: () => void) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       fn();
     };
-    const onAbort = () => {
-      done(() => {
-        try { onTimeout?.(); } catch { /* ignore */ }
-        reject(new Error(`aborted: ${label}`));
-      });
-    };
-    const timer = setTimeout(() => {
-      done(() => {
-        try { onTimeout?.(); } catch { /* ignore */ }
-        reject(new Error(`timeout: ${label} exceeded ${Math.round(limit / 1000)}s`));
-      });
-    }, limit);
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const onAbort = () => finish(() => reject(new Error(`aborted: ${label}`)));
+    // Observe the work even when already aborted, preventing a late unhandled rejection.
     Promise.resolve(p).then(
-      (v) => done(() => resolve(v)),
-      (e) => done(() => reject(e instanceof Error ? e : new Error(String(e)))),
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error instanceof Error ? error : new Error(String(error)))),
     );
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (ms > 0) timer = setTimeout(() => finish(() => {
+      try { onTimeout?.(); } catch { /* cleanup is best effort */ }
+      reject(new Error(`timeout: ${label} exceeded ${Math.round(ms / 1000)}s`));
+    }), ms);
   });
 }
 
@@ -199,61 +155,7 @@ export const STOP = new Set([
 // Diff helpers
 // ---------------------------------------------------------------------------
 
-/** Minimal LCS line diff, emitting only changed regions plus a little context. */
-export function makeDiff(_filePath: string, before: string, after: string): string {
-  const a = before.split("\n");
-  const b = after.split("\n");
-  const n = a.length;
-  const m = b.length;
-  const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
-    }
-  }
-
-  type Op = { t: " " | "+" | "-"; line: string };
-  const ops: Op[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m) {
-    if (a[i] === b[j]) {
-      ops.push({ t: " ", line: a[i] });
-      i++;
-      j++;
-    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
-      ops.push({ t: "-", line: a[i] });
-      i++;
-    } else {
-      ops.push({ t: "+", line: b[j] });
-      j++;
-    }
-  }
-  while (i < n) ops.push({ t: "-", line: a[i++] });
-  while (j < m) ops.push({ t: "+", line: b[j++] });
-
-  const CONTEXT = 3;
-  const keep = new Array(ops.length).fill(false);
-  for (let k = 0; k < ops.length; k++) {
-    if (ops[k].t !== " ") {
-      for (let x = Math.max(0, k - CONTEXT); x <= Math.min(ops.length - 1, k + CONTEXT); x++) keep[x] = true;
-    }
-  }
-
-  const out: string[] = [];
-  let prevKept = true;
-  for (let k = 0; k < ops.length; k++) {
-    if (!keep[k]) {
-      if (prevKept) out.push("…");
-      prevKept = false;
-      continue;
-    }
-    prevKept = true;
-    const o = ops[k];
-    out.push((o.t === " " ? "  " : o.t + " ") + o.line);
-  }
-  return out.join("\n");
-}
+export { makeDiff } from "../../shared/lineDiff";
 
 /** 1-based line number of the first difference between two texts. */
 export function firstDiffLine(before: string, after: string): number {
@@ -266,16 +168,7 @@ export function firstDiffLine(before: string, after: string): number {
   return Math.min(a.length, b.length) + 1;
 }
 
-/** Slugify a string for use as a filename. */
-export function slugify(s: string): string {
-  return (
-    String(s || "plan")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 60) || "plan"
-  );
-}
+export { slugify } from "../../shared/planPath";
 
 /**
  * Locate a usable ripgrep binary (cached).
@@ -371,12 +264,39 @@ export interface ShellNotify {
 /** Lifecycle state of a shell command (drives the footer the model/UI reads). */
 export type ShellStatus = "running" | "completed" | "failed" | "aborted" | "timeout" | "backgrounded";
 
+/** Limits apply per extension host. Active processes still have a ten-minute lifetime. */
+export const SHELL_OUTPUT_LIMITS = Object.freeze({
+  memoryChars: 64 * 1024,
+  transcriptBytes: 8 * 1024 * 1024,
+  jobs: 32,
+  retentionMs: 24 * 60 * 60 * 1000,
+  readChars: 5400,
+  readLines: 120,
+});
+
+interface ShellTranscript {
+  path?: string;
+  writer?: WriteStream;
+  bytes: number;
+  flushedBytes: number;
+  truncated: boolean;
+  unavailable: boolean;
+  pending: number;
+  flushWaiters: Set<() => void>;
+  finished?: Promise<void>;
+}
+
 export interface BgShell {
   id: string;
+  /** Conversation ownership is distinct from the run that owns the process. */
+  ownerKey?: string;
+  sessionKey?: string;
   command: string;
   /** The child shell running this command (unset until spawned). */
   proc?: ChildProcess;
   output: string;
+  outputChars?: number;
+  transcript?: ShellTranscript;
   done: boolean;
   exitCode: number | null;
   startedAt: number;
@@ -392,21 +312,205 @@ export interface BgShell {
   pump?: () => void;
   /** Live-output sink (streams the rendered card to the UI while running). */
   onChunk?: (chunk: string) => void;
+  outputListeners?: Set<(chunk: string) => void>;
+  /** Disposes process-lifetime listeners/timers; never persisted with the job metadata. */
+  cleanup?: () => void;
+  abort?: () => void;
 }
 
 export const bgShells = new Map<string, BgShell>();
-let bgShellSeq = 0;
 export function nextShellId(): string {
-  return `sh_${++bgShellSeq}`;
+  return `shell_${randomUUID().replace(/-/g, "")}`;
+}
+
+let transcriptDirectory: Promise<string> | undefined;
+let retentionTimer: ReturnType<typeof setInterval> | undefined;
+
+async function getTranscriptDirectory(): Promise<string> {
+  if (!transcriptDirectory) transcriptDirectory = (async () => {
+    // A private per-host directory prevents account/session collisions. The common
+    // root is checked before following it; old host directories expire after 24h.
+    const root = path.join(os.tmpdir(), `opencursor-terminal-${process.getuid?.() ?? "user"}`);
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
+    const stat = await fs.lstat(root);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) {
+      throw new Error("Terminal transcript directory is not owned by this user");
+    }
+    await fs.chmod(root, 0o700);
+    for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^host-[A-Za-z0-9]+$/.test(entry.name)) continue;
+      const candidate = path.join(root, entry.name);
+      const old = await fs.lstat(candidate).catch(() => undefined);
+      if (old && !old.isSymbolicLink() && Date.now() - old.mtimeMs > SHELL_OUTPUT_LIMITS.retentionMs) {
+        await fs.rm(candidate, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+    const directory = await fs.mkdtemp(path.join(root, "host-"));
+    await fs.chmod(directory, 0o700);
+    return directory;
+  })().catch(error => { transcriptDirectory = undefined; throw error; });
+  return transcriptDirectory;
+}
+
+function releaseTranscriptWaiters(log: ShellTranscript): void {
+  if (log.pending && !log.unavailable) return;
+  for (const resolve of log.flushWaiters) resolve();
+  log.flushWaiters.clear();
+}
+
+export async function flushShellTranscript(sh: BgShell, signal?: AbortSignal): Promise<void> {
+  const log = sh.transcript;
+  if (log && log.pending && !log.unavailable) {
+    await new Promise<void>(resolve => {
+      const finish = () => {
+        signal?.removeEventListener("abort", finish);
+        log.flushWaiters.delete(finish);
+        resolve();
+      };
+      if (signal?.aborted) { finish(); return; }
+      log.flushWaiters.add(finish);
+      signal?.addEventListener("abort", finish, { once: true });
+    });
+  }
+}
+
+/** Close the writer after queued output; calling this more than once is harmless. */
+export async function finishShellTranscript(sh: BgShell): Promise<void> {
+  const log = sh.transcript;
+  if (!log?.writer) return;
+  if (!log.finished) {
+    const writer = log.writer;
+    log.finished = new Promise<void>(resolve => {
+      if (writer.closed) { resolve(); return; }
+      writer.once("close", resolve);
+      writer.end();
+    }).finally(() => { log.writer = undefined; });
+  }
+  await log.finished;
+}
+
+/** Evict only finished jobs. References may expire earlier when the capacity is full. */
+export async function pruneShellJobs(now = Date.now(), makeRoom = false): Promise<void> {
+  const completed = [...bgShells.values()].filter(sh => sh.done && !sh.proc)
+    .sort((a, b) => (a.endedAt ?? a.startedAt) - (b.endedAt ?? b.startedAt));
+  for (const sh of completed) {
+    if (now - (sh.endedAt ?? sh.startedAt) < SHELL_OUTPUT_LIMITS.retentionMs
+      && (!makeRoom || bgShells.size < SHELL_OUTPUT_LIMITS.jobs)) continue;
+    // Delete from the registry first, so concurrent readers cannot gain access
+    // while cleanup is waiting for the last disk write.
+    if (bgShells.get(sh.id) !== sh) continue;
+    bgShells.delete(sh.id);
+    await finishShellTranscript(sh);
+    if (sh.transcript?.path) await fs.unlink(sh.transcript.path).catch(() => {});
+    sh.onChunk = undefined;
+    sh.notify = undefined;
+    sh.output = "";
+  }
+  if (!bgShells.size && retentionTimer) {
+    clearInterval(retentionTimer);
+    retentionTimer = undefined;
+  }
+}
+
+/** Reserve a bounded registry entry and create a private disk spool before spawning. */
+export async function registerShellJob(sh: BgShell): Promise<void> {
+  await pruneShellJobs(Date.now(), true);
+  if (bgShells.size >= SHELL_OUTPUT_LIMITS.jobs) {
+    throw new Error(`At most ${SHELL_OUTPUT_LIMITS.jobs} active terminal jobs can be retained; wait for an existing job to finish`);
+  }
+  bgShells.set(sh.id, sh);
+  if (!retentionTimer) {
+    retentionTimer = setInterval(() => { void pruneShellJobs().catch(() => {}); }, 60_000);
+    retentionTimer.unref?.();
+  }
+  const log: ShellTranscript = {
+    bytes: 0, flushedBytes: 0, truncated: false, unavailable: false, pending: 0, flushWaiters: new Set(),
+  };
+  sh.transcript = log;
+  try {
+    const directory = await getTranscriptDirectory();
+    log.path = path.join(directory, `${sh.id}.log`);
+    const writer = createWriteStream(log.path, { flags: "wx", mode: 0o600, highWaterMark: 64 * 1024 });
+    log.writer = writer;
+    writer.on("error", () => {
+      log.unavailable = true;
+      log.truncated = true;
+      releaseTranscriptWaiters(log);
+      // Logging must not leave the command paused forever if the disk fails.
+      sh.proc?.stdout?.resume();
+      sh.proc?.stderr?.resume();
+    });
+    writer.on("drain", () => { sh.proc?.stdout?.resume(); sh.proc?.stderr?.resume(); });
+    await new Promise<void>((resolve, reject) => {
+      writer.once("open", () => { writer.off("error", reject); resolve(); });
+      writer.once("error", reject);
+    });
+  } catch {
+    log.unavailable = true;
+    log.truncated = true;
+  }
+}
+
+export function getOwnedShell(ownerKey: string | undefined, id: string): BgShell | undefined {
+  if (!ownerKey) return undefined;
+  const sh = bgShells.get(id);
+  if (!sh || sh.ownerKey !== ownerKey) return undefined;
+  if (sh.done && Date.now() - (sh.endedAt ?? sh.startedAt) >= SHELL_OUTPUT_LIMITS.retentionMs) return undefined;
+  return sh;
+}
+
+export function shellOutcome(sh: BgShell): ToolOutcome {
+  const log = sh.transcript;
+  const status = sh.status === "timeout" ? "timed_out" : sh.status === "backgrounded" ? "running" : sh.status;
+  return {
+    status,
+    processStatus: status,
+    ...(sh.exitCode === null ? {} : { exitCode: sh.exitCode }),
+    jobId: sh.id,
+    outputRef: {
+      id: sh.id,
+      available: !!log?.path && !log.unavailable,
+      truncated: log?.truncated ?? true,
+      bytes: log?.bytes ?? 0,
+      expiresAt: (sh.endedAt ?? sh.startedAt) + SHELL_OUTPUT_LIMITS.retentionMs,
+    },
+  };
 }
 
 /**
- * Feed new output into a shell, appending to its buffer and firing the
- * notify_on_output hook when the pattern matches (respecting debounce).
+ * Keep a bounded head/tail preview and stream the exact decoded output to disk.
+ * Pause both pipes on disk backpressure, so queued writes cannot grow without bound.
  */
 export function pushShellOutput(sh: BgShell, chunk: string): void {
-  sh.output += chunk;
+  sh.outputChars = (sh.outputChars ?? sh.output.length) + chunk.length;
+  const preview = sh.output + chunk;
+  const head = Math.floor(SHELL_OUTPUT_LIMITS.memoryChars / 4);
+  sh.output = preview.length <= SHELL_OUTPUT_LIMITS.memoryChars ? preview
+    : preview.slice(0, head) + preview.slice(-(SHELL_OUTPUT_LIMITS.memoryChars - head));
+  const log = sh.transcript;
+  if (log?.writer && !log.unavailable && !log.truncated) {
+    const bytes = Buffer.from(chunk, "utf8");
+    let keep = Math.min(bytes.length, SHELL_OUTPUT_LIMITS.transcriptBytes - log.bytes);
+    // Never retain half a UTF-8 code point at the disk limit.
+    if (keep < bytes.length) {
+      while (keep > 0 && (bytes[keep] & 0xc0) === 0x80) keep--;
+      log.truncated = true;
+    }
+    if (keep > 0) {
+      log.bytes += keep;
+      log.pending++;
+      const ready = log.writer.write(bytes.subarray(0, keep), error => {
+        if (!error) log.flushedBytes += keep;
+        log.pending--;
+        releaseTranscriptWaiters(log);
+      });
+      if (!ready) { sh.proc?.stdout?.pause(); sh.proc?.stderr?.pause(); }
+    }
+  }
   try { sh.onChunk?.(chunk); } catch { /* ignore */ }
+  for (const listener of sh.outputListeners ?? []) {
+    try { listener(chunk); } catch { /* an observer must not interrupt the process */ }
+  }
   const n = sh.notify;
   if (!n || !n.emit) return;
   if (!n.re.test(chunk)) return;
@@ -416,8 +520,104 @@ export function pushShellOutput(sh: BgShell, chunk: string): void {
   n.emit(`Monitored ${n.reason}: matched in shell ${sh.id}`);
 }
 
+/** Read an exact, bounded excerpt of a conversation-owned terminal transcript. */
+export async function readShellTranscript(ownerKey: string | undefined, input: ContextReadInput, signal?: AbortSignal): Promise<string> {
+  const sh = getOwnedShell(ownerKey, input?.id);
+  if (!sh || !/^shell_[a-f0-9]{32}$/.test(input.id)) {
+    return "error: terminal transcript is unavailable in this conversation (expired or unknown job)";
+  }
+  for (const key of ["start_line", "end_line", "start_column"] as const) {
+    if (input[key] !== undefined && (!Number.isSafeInteger(input[key]) || input[key]! < 1)) {
+      return `error: ${key} must be a positive integer`;
+    }
+  }
+  const startLine = input.start_line ?? 1;
+  const startColumn = input.start_column ?? 1;
+  const endLine = input.end_line ?? Infinity;
+  if (endLine < startLine) return "error: end_line must be at least start_line";
+  if (input.pattern !== undefined && (typeof input.pattern !== "string" || !input.pattern.length || input.pattern.length > 4096)) {
+    return "error: pattern must contain 1–4096 literal characters";
+  }
+  if (signal?.aborted) return "error: terminal transcript read aborted";
+  await flushShellTranscript(sh, signal);
+  if (signal?.aborted) return "error: terminal transcript read aborted";
+  const log = sh.transcript;
+  if (!log?.path || log.unavailable) return "error: terminal transcript storage is unavailable; only the terminal preview was retained";
+  let line = 1, column = 1;
+  let fromLine = startLine, fromColumn = startColumn;
+  let body = "";
+  // Linear-time streaming literal search, including matches spanning disk
+  // chunks. A bounded position ring supplies exact line/column coordinates.
+  const needle = input.pattern ? [...input.pattern] : [];
+  const prefix = Array<number>(needle.length).fill(0);
+  for (let i = 1, j = 0; i < needle.length; i++) {
+    while (j && needle[i] !== needle[j]) j = prefix[j - 1];
+    if (needle[i] === needle[j]) j++;
+    prefix[i] = j;
+  }
+  const positions: Array<{ line: number; column: number }> = [];
+  let searched = 0, matchedChars = 0;
+  let selected = false, matched = !input.pattern, stopped = false;
+  const snapshotBytes = log.flushedBytes;
+  if (!snapshotBytes) return `id: ${sh.id}\nstatus: ${shellOutcome(sh).status}\n${sh.done ? "End of retained transcript." : "next_line: 1; next_column: 1"}\n\n(no output retained yet)`;
+  try {
+    // Snapshot the retained prefix so reading a live writer always finishes.
+    const reader = createReadStream(log.path, { encoding: "utf8", highWaterMark: 16 * 1024, end: snapshotBytes - 1, signal });
+    for await (const raw of reader) {
+      for (const char of String(raw)) {
+        if (line > endLine) { stopped = true; break; }
+        if (line >= startLine && (line > startLine || column >= startColumn)) {
+          if (!matched) {
+            positions[searched % needle.length] = { line, column };
+            searched++;
+            while (matchedChars && char !== needle[matchedChars]) matchedChars = prefix[matchedChars - 1];
+            if (char === needle[matchedChars]) matchedChars++;
+            if (matchedChars === needle.length) {
+              matched = true; selected = true;
+              const from = positions[(searched - needle.length) % needle.length];
+              fromLine = from.line; fromColumn = from.column; body = input.pattern!;
+              // A multi-line search term may itself exceed the page's line
+              // budget. Resume inside that match, rather than returning an
+              // oversized first page or discarding its remaining characters.
+              let lines = 0, units = 0, points = 0;
+              for (const part of needle) {
+                units += part.length; points++;
+                if (part === "\n" && ++lines === SHELL_OUTPUT_LIMITS.readLines) break;
+              }
+              if (units < body.length) {
+                body = body.slice(0, units);
+                const resume = positions[(searched - needle.length + points) % needle.length];
+                line = resume.line; column = resume.column;
+                stopped = true;
+                break;
+              }
+            }
+          } else {
+            if (!selected) { selected = true; fromLine = line; fromColumn = column; }
+            if (body.length + char.length > SHELL_OUTPUT_LIMITS.readChars || line - fromLine >= SHELL_OUTPUT_LIMITS.readLines) {
+              stopped = true; break;
+            }
+            body += char;
+          }
+        }
+        if (char === "\n") { line++; column = 1; } else column += char.length;
+      }
+      if (stopped) break;
+    }
+  } catch {
+    return signal?.aborted ? "error: terminal transcript read aborted" : "error: terminal transcript is no longer available";
+  }
+  const status = shellOutcome(sh).status;
+  const header = `id: ${sh.id}\nstatus: ${status}; retained_bytes: ${snapshotBytes}; transcript_truncated: ${log.truncated}`;
+  if (!matched) return `${header}\nNo literal match in the requested retained range.`;
+  if (!selected && (startLine > line || startLine === line && startColumn > column)) return "error: requested position exceeds the retained transcript";
+  const cursor = `next_line: ${line}; next_column: ${column}`;
+  const next = stopped ? cursor : sh.done ? "End of retained transcript." : `${cursor}\nEnd of currently retained output; job is still running.`;
+  return `${header}\nstart_line: ${fromLine}; start_column: ${fromColumn}\n${next}\n\n${body}`;
+}
+
 // ---------------------------------------------------------------------------
-// Persistent stateful shell sessions (cwd/env persist across commands per run)
+// Shell sessions (standalone cd persists across commands per run)
 // ---------------------------------------------------------------------------
 
 /**
@@ -461,6 +661,7 @@ export function spawnShellCommand(command: string, cwd: string): ChildProcess {
       )
     : spawn("bash", ["--noprofile", "--norc", "-c", command], {
         cwd,
+        detached: true,
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, TERM: "dumb", PS1: "", PS2: "" },
       });
@@ -470,12 +671,13 @@ export function spawnShellCommand(command: string, cwd: string): ChildProcess {
     proc.stdin?.on("error", () => { /* ignore broken pipe */ });
     proc.stdin?.end();
   } catch { /* ignore */ }
+  if (!IS_WIN) proc.once("exit", () => killShellProcess(proc));
   return proc;
 }
 
 /** Kill a command and everything it spawned (npm/pnpm scripts spawn children). */
 export function killShellProcess(proc: ChildProcess): void {
-  if (!proc || proc.exitCode != null || proc.signalCode) return;
+  if (!proc || (IS_WIN && (proc.exitCode != null || proc.signalCode))) return;
   try {
     if (IS_WIN && proc.pid) {
       const killer = spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { windowsHide: true });
@@ -506,6 +708,9 @@ export function applyCwdSideEffect(session: ShellSession, command: string): void
 export function disposeShellSession(key: string): void {
   const s = shellSessions.get(key);
   if (!s) return;
+  for (const sh of bgShells.values()) {
+    if (sh.sessionKey === key && !sh.done) sh.abort?.();
+  }
   for (const proc of s.running) killShellProcess(proc);
   s.running.clear();
   shellSessions.delete(key);
@@ -518,20 +723,34 @@ export function disposeShellSession(key: string): void {
 export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let interval: ReturnType<typeof setInterval> | undefined;
     const finish = () => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       if (interval) clearInterval(interval);
+      sh.outputListeners?.delete(onOutput);
       signal?.removeEventListener("abort", onAbort);
       resolve();
     };
     const onAbort = () => finish();
+    let recent = sh.output?.slice(-Math.floor(SHELL_OUTPUT_LIMITS.memoryChars * 3 / 4)) ?? "";
+    const onOutput = (chunk: string) => {
+      if (!pattern) return;
+      const arriving = recent + chunk;
+      recent = arriving.slice(-SHELL_OUTPUT_LIMITS.memoryChars);
+      if (pattern.test(arriving)) finish();
+    };
     if (signal?.aborted) {
       onAbort();
       return;
     }
     signal?.addEventListener("abort", onAbort, { once: true });
+    if (pattern) {
+      sh.outputListeners ??= new Set();
+      sh.outputListeners.add(onOutput);
+    }
 
     const deadline = Date.now() + Math.max(0, ms);
     const check = () => {
@@ -539,14 +758,19 @@ export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?:
       if (sh.done) return finish();
       if (pattern) {
         try {
-          if (pattern.test(sh.output)) return finish();
+          const shortened = (sh.outputChars ?? sh.output.length) > sh.output.length;
+          const head = Math.floor(SHELL_OUTPUT_LIMITS.memoryChars / 4);
+          // Do not fabricate a match spanning the omitted middle of a preview.
+          if (shortened
+            ? pattern.test(sh.output.slice(0, head)) || pattern.test(sh.output.slice(head))
+            : pattern.test(sh.output)) return finish();
         } catch { /* bad pattern mid-wait */ }
       }
       if (ms <= 0 || Date.now() >= deadline) return finish();
     };
     // Hard wall-clock: never tick forever even if setInterval stalls.
-    const timer = setTimeout(finish, Math.max(ms, 0) + 250);
-    const interval = setInterval(check, 50);
+    timer = setTimeout(finish, Math.max(ms, 0) + 250);
+    interval = setInterval(check, 50);
     check();
   });
 }
@@ -605,16 +829,22 @@ export function renderShell(sh: BgShell): string {
   const cleaned = collapseRepeats(
     sh.output.replace(/\r(?!\n)/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd(),
   );
-  const body = clampMiddle(cleaned, 12000);
+  const body = clampMiddle(cleaned, 10000);
+  const reference = shellOutcome(sh).outputRef!;
+  const omitted = Math.max(0, (sh.outputChars ?? sh.output.length) - sh.output.length);
+  const transcript = reference.available
+    ? `Transcript: ReadContext {"id":"${sh.id}"} (retained_bytes=${reference.bytes}${reference.truncated ? "; truncated at storage limit or write failure" : ""}; up to 24h retention, capacity may evict earlier).`
+    : "Transcript storage unavailable; only this bounded preview is retained.";
+  const head = `[shell ${sh.id}]${sh.proc?.pid ? ` pid=${sh.proc.pid}` : ""} ${sh.done ? "elapsed_ms" : "running_for_ms"}=${elapsed}${sh.cwd ? ` cwd=${sh.cwd}` : ""}`;
+  const note = omitted ? `\n[Preview omitted ${omitted} characters; use the transcript reference for retained output.]` : "";
   if (sh.done) {
-    const code = sh.exitCode ?? 0;
+    const code = sh.exitCode ?? "unknown";
     const sig = sh.signal ? ` signal=${sh.signal}` : "";
     // Footer keeps a machine-readable exit_code (the UI colors the card from it).
-    return `${body || "(no output)"}\n(exit_code=${code}${sig} ${statusLabel(sh)} in ${elapsed}ms)`;
+    return `${head}\n${body || "(no output)"}${note}\n(exit_code=${code}${sig} ${statusLabel(sh)} in ${elapsed}ms)\n${transcript}`;
   }
   // Still running: keep the poll hint + id so the model can await it.
-  const head = `[shell ${sh.id}] running_for_ms=${elapsed}${sh.cwd ? ` cwd=${sh.cwd}` : ""}`;
-  return `${head}\n${body}\n(still running - poll with AwaitShell shell_id="${sh.id}")`;
+  return `${head}\n${body}${note}\n(still running - poll with AwaitShell shell_id="${sh.id}")\n${transcript}`;
 }
 
 // ---------------------------------------------------------------------------

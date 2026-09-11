@@ -10,11 +10,13 @@
 import * as vscode from "vscode";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { importRuntimeDep } from "../../runtimeDeps";
 import { safePath, getWorkspaceRoot } from "../../context/workspaceUtils";
-import { pendingChanges } from "../../stores/pendingChanges";
+import { mutateFile } from "../../stores/fileMutations";
 import { defineTool, type Tool, type ToolResult, type ToolContext } from "./types";
 import { IGNORE, makeDiff, firstDiffLine } from "./shared";
 import { scanFilesCached, compileGlob, normalizeGlobPattern, scorePath } from "./fileScan";
+import { readTextPage } from "./textRead";
 
 // Image extensions the Read tool returns as base64 blocks to the model.
 const IMAGE_MIME: Record<string, string> = {
@@ -89,16 +91,9 @@ function readErrMsg(e: unknown, pathHint: string): string {
 	}
 }
 
-function looksBinary(buf: Buffer): boolean {
-	const n = Math.min(buf.length, 8_192);
-	let odd = 0;
-	for (let i = 0; i < n; i++) {
-		const b = buf[i];
-		if (b === 0) return true;
-		// High ratio of non-text control bytes → binary
-		if (b < 7 || (b > 13 && b < 32 && b !== 27)) odd++;
-	}
-	return n > 0 && odd / n > 0.3;
+function readFailure(error: unknown, pathHint: string): ToolResult {
+	const message = error instanceof Error ? error.message : String(error);
+	return { output: readErrMsg(error, pathHint), outcome: { status: message.startsWith("aborted:") ? "aborted" : message.startsWith("timeout:") ? "timed_out" : "failed" } };
 }
 
 // ---- Read ----
@@ -107,7 +102,7 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 		if (typeof input.path !== "string" || !input.path) {
 			return { output: "error: path is required and must be a string" };
 		}
-		if (abortSignal?.aborted) return { output: "error: aborted" };
+		if (abortSignal?.aborted) return { output: "error: aborted", outcome: { status: "aborted" } };
 
 		const pathHint = String(input.path);
 		let p: string;
@@ -127,7 +122,7 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 		try {
 			st = await withAbortTimeout(fs.stat(p), READ_STAT_MS, abortSignal, "stat");
 		} catch (e) {
-			return { output: readErrMsg(e, pathHint) };
+			return readFailure(e, pathHint);
 		}
 		if (st.isDirectory()) {
 			return {
@@ -146,7 +141,7 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 				try {
 					st = await withAbortTimeout(fs.stat(p), READ_STAT_MS, abortSignal, "stat");
 				} catch (e) {
-					return { output: readErrMsg(e, pathHint) };
+					return readFailure(e, pathHint);
 				}
 				if (st.isDirectory()) {
 					return {
@@ -157,17 +152,14 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			if (msg.startsWith("timeout:") || msg.startsWith("aborted:")) {
-				return { output: readErrMsg(e, pathHint) };
+				return readFailure(e, pathHint);
 			}
 			// keep original p; read below will surface errors
 		}
-		if (st.size > READ_MAX_BYTES) {
-			return {
-				output: `error: file too large (${st.size} bytes, max ${READ_MAX_BYTES}). Use offset/limit on a text file or pick a smaller path.`,
-			};
-		}
-
 		const ext = path.extname(p).toLowerCase();
+		if (st.size > READ_MAX_BYTES && (IMAGE_MIME[ext] || ext === ".pdf")) {
+			return { output: `error: image/PDF too large (${st.size} bytes, max ${READ_MAX_BYTES}). Resize the image or extract the PDF text to a local text file before reading.` };
+		}
 
 		// Image files: return a base64 image block so it reaches the model.
 		if (IMAGE_MIME[ext]) {
@@ -178,26 +170,24 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 					image: { mime: IMAGE_MIME[ext], base64: buf.toString("base64") },
 				};
 			} catch (e) {
-				return { output: readErrMsg(e, String(input.path)) };
+				return readFailure(e, String(input.path));
 			}
 		}
 
 		// PDF files: extract text (honoring the same char cap as text reads).
 		if (ext === ".pdf") {
+			let parser: { getText(): Promise<{ text?: string }>; destroy?(): Promise<void> } | undefined;
 			try {
-				const { PDFParse } = await import("pdf-parse");
+				const { PDFParse } = await importRuntimeDep("pdf-parse");
 				const buf = await withAbortTimeout(fs.readFile(p, readOpts), READ_IO_MS, abortSignal, "Read");
-				const parser = new PDFParse({ data: new Uint8Array(buf) });
-				const res = await withAbortTimeout(parser.getText(), READ_IO_MS, abortSignal, "PDF parse");
-				try {
-					await parser.destroy?.();
-				} catch {
-					/* ignore */
-				}
+				parser = new PDFParse({ data: new Uint8Array(buf) });
+				const res = await withAbortTimeout(parser!.getText(), READ_IO_MS, abortSignal, "PDF parse");
 				const text = (res?.text ?? "").slice(0, 100_000);
 				return { output: text || "(no extractable text in PDF)" };
 			} catch (e) {
 				return { output: `error: cannot read PDF: ${e instanceof Error ? e.message : String(e)}` };
+			} finally {
+				try { await parser?.destroy?.(); } catch { /* parser cleanup must not hide the result */ }
 			}
 		}
 
@@ -207,69 +197,9 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 			};
 		}
 
-		let buf: Buffer;
-		try {
-			buf = await withAbortTimeout(fs.readFile(p, readOpts), READ_IO_MS, abortSignal, "Read");
-		} catch (e) {
-			return { output: readErrMsg(e, String(input.path)) };
-		}
-
-		if (buf.length === 0) return { output: "File is empty." };
-
-		if (looksBinary(buf)) {
-			return {
-				output: `error: binary content detected (${buf.length} bytes) — cannot display as text. Path: ${input.path}`,
-			};
-		}
-
-		// Decode as UTF-8 (replacement for invalid sequences so latin-1-ish files still open).
-		let content = buf.toString("utf8");
-		// Strip UTF-8 BOM if present.
-		if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
-
-		const lines = content.split(/\r?\n/);
-		const totalLines = lines.length;
-		// Map Cursor's offset/limit (whole-file by default) to a line window.
-		let start = 1;
-		let end = totalLines;
-		if (input.offset !== undefined && input.offset !== null) {
-			const off = Number(input.offset);
-			if (!Number.isFinite(off)) {
-				return { output: `error: invalid offset: ${input.offset}` };
-			}
-			start = off < 0 ? Math.max(1, totalLines + off + 1) : Math.max(1, Math.floor(off));
-		}
-		// Default line cap: whole-file reads shouldn't dump thousands of lines
-		// into context. Callers wanting more pass an explicit limit/offset.
-		const DEFAULT_MAX_LINES = 1500;
-		let capped = false;
-		if (input.limit !== undefined && input.limit !== null) {
-			const lim = Number(input.limit);
-			if (!Number.isFinite(lim) || lim < 1) {
-				return { output: `error: invalid limit: ${input.limit}` };
-			}
-			end = Math.min(totalLines, start + Math.floor(lim) - 1);
-		} else if (input.offset !== undefined && input.offset !== null) {
-			end = totalLines;
-		} else if (totalLines > DEFAULT_MAX_LINES) {
-			end = DEFAULT_MAX_LINES;
-			capped = true;
-		}
-		if (end < start) end = start;
-		if (start > totalLines) {
-			return { output: `error: offset ${start} past end of file (${totalLines} lines)` };
-		}
-
-		let out = lines
-			.slice(start - 1, end)
-			.map((l, idx) => `${start + idx}|${l}`)
-			.join("\n");
-		if (capped) {
-			out += `\n... (${totalLines - end} more lines - read with offset=${end + 1} to continue)`;
-		}
-		return { output: out, startLine: start, endLine: end };
+		return await readTextPage(p, input, abortSignal);
 	} catch (e) {
-		return { output: readErrMsg(e, String((input as { path?: string })?.path ?? "")) };
+		return readFailure(e, String((input as { path?: string })?.path ?? ""));
 	}
 });
 
@@ -407,152 +337,62 @@ function blockedInMultitask(ctx?: ToolContext): boolean {
 	return m === "multitask" || m === "project";
 }
 
-const editExecute: Tool["execute"] = async (input, _signal, _callId, ctx) => {
+const editExecute: Tool["execute"] = async (input, signal, _callId, ctx) => {
 	if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
-	if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-	let p: string;
+	if (typeof input?.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
 	try {
-		p = safePath(input.path);
-	} catch (e) {
-		return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-	}
-	let existedBefore = false;
-	try {
-		await fs.access(p);
-		existedBefore = true;
-	} catch {}
-	const original = existedBefore ? await fs.readFile(p, "utf8") : "";
-
-	// Write: full create / overwrite.
-	if (input.contents !== undefined && input.old_string === undefined) {
-		await fs.mkdir(path.dirname(p), { recursive: true });
-		await fs.writeFile(p, input.contents, "utf8");
-		pendingChanges.record(input.path, original, input.contents, existedBefore);
-		return {
-			output: `wrote ${input.path} (${input.contents.split("\n").length} lines)`,
-			diff: makeDiff(input.path, original, input.contents),
-			startLine: firstDiffLine(original, input.contents),
-		};
-	}
-
-	if (!existedBefore) {
-		return { output: `error: ${input.path} does not exist; pass contents to create it` };
-	}
-
-	const oldS = input.old_string ?? "";
-	const newS = input.new_string ?? "";
-	const replaceAll = input.replace_all ?? input.allow_multiple_matches;
-	let matched = original;
-
-	// Strategy 1: exact substring match.
-	const idx = original.indexOf(oldS);
-	if (idx !== -1) {
-		const isUnique = original.indexOf(oldS, idx + 1) === -1;
-		if (!isUnique && !replaceAll) {
-			return { output: `error: old_string is not unique in ${input.path}; add more context or set replace_all` };
-		}
-		matched = replaceAll ? original.split(oldS).join(newS) : original.slice(0, idx) + newS + original.slice(idx + oldS.length);
-	} else {
-		// Strategy 2: whitespace-insensitive line-window match.
-		const norm = (s: string) => s.replace(/\s+/g, " ").trim();
-		const target = norm(oldS);
-		const lines = original.split("\n");
-		const windowSize = Math.max(1, oldS.split("\n").length);
-		const candidates: number[] = [];
-		for (let i = 0; i <= lines.length - windowSize; i++) {
-			if (norm(lines.slice(i, i + windowSize).join("\n")) === target) candidates.push(i);
-		}
-		if (candidates.length === 0) {
-			return { output: `error: could not find old_string in ${input.path}` };
-		}
-		if (candidates.length > 1 && !replaceAll) {
-			return { output: `error: old_string matches ${candidates.length} locations in ${input.path}; add more context` };
-		}
-		const targets = replaceAll ? candidates.slice().reverse() : [candidates[0]];
-		for (const found of targets) lines.splice(found, windowSize, ...newS.split("\n"));
-		matched = lines.join("\n");
-	}
-
-	if (matched === original) {
-		return { output: `error: edit produced no change in ${input.path}` };
-	}
-	await fs.writeFile(p, matched, "utf8");
-	pendingChanges.record(input.path, original, matched, existedBefore);
-	return {
-		output: `edited ${input.path}`,
-		diff: makeDiff(input.path, original, matched),
-		startLine: firstDiffLine(original, matched),
-	};
+		return await mutateFile<ToolResult>(input.path, { signal, owner: ctx?.changeOwner }, (snapshot) => {
+			const original = snapshot.data?.toString("utf8") ?? "";
+			const fail = (message: string) => ({ data: snapshot.data, result: { output: `error: ${message}` } });
+			let matched: string;
+			if (input.contents !== undefined && input.old_string === undefined) {
+				if (typeof input.contents !== "string") return fail("contents must be a string");
+				matched = input.contents;
+			} else {
+				if (!snapshot.data) return fail(`${input.path} does not exist; pass contents to create it`);
+				if (snapshot.data.includes(0) || !Buffer.from(original).equals(snapshot.data)) return fail("StrReplace only edits UTF-8 text files");
+				if (typeof input.old_string !== "string" || !input.old_string.length || typeof input.new_string !== "string") {
+					return fail("old_string must be nonempty and new_string must be a string");
+				}
+				const oldS = input.old_string, newS = input.new_string;
+				const replaceAll = input.replace_all === true || input.allow_multiple_matches === true;
+				const idx = original.indexOf(oldS);
+				if (idx !== -1) {
+					if (original.indexOf(oldS, idx + 1) !== -1 && !replaceAll) return fail(`old_string is not unique in ${input.path}; add more context or set replace_all`);
+					matched = replaceAll ? original.split(oldS).join(newS) : original.slice(0, idx) + newS + original.slice(idx + oldS.length);
+				} else {
+					const norm = (value: string) => value.replace(/\s+/g, " ").trim();
+					const target = norm(oldS), lines = original.split("\n"), windowSize = oldS.split("\n").length;
+					const candidates: number[] = [];
+					for (let i = 0; i <= lines.length - windowSize; i++) if (norm(lines.slice(i, i + windowSize).join("\n")) === target) candidates.push(i);
+					if (!candidates.length) return fail(`could not find old_string in ${input.path}`);
+					if (candidates.length > 1 && !replaceAll) return fail(`old_string matches ${candidates.length} locations in ${input.path}; add more context`);
+					for (const index of replaceAll ? candidates.reverse() : [candidates[0]]) lines.splice(index, windowSize, ...newS.split("\n"));
+					matched = lines.join("\n");
+				}
+				if (matched === original) return fail(`edit produced no change in ${input.path}`);
+			}
+			return { data: Buffer.from(matched), result: {
+				output: input.contents !== undefined ? `wrote ${input.path} (${matched.split("\n").length} lines)` : `edited ${input.path}`,
+				diff: makeDiff(input.path, original, matched), startLine: firstDiffLine(original, matched),
+			} };
+		});
+	} catch (error) { return { output: `error: ${error instanceof Error ? error.message : String(error)}` }; }
 };
 
 export const strReplaceTool = defineTool("StrReplace", true, editExecute);
 export const writeTool = defineTool("Write", true, editExecute);
 
-// ---- Delete ----
-const DELETE_IO_MS = 8_000;
-const DELETE_BACKUP_MAX = 2 * 1024 * 1024; // 2 MiB snapshot for undo
-
-export const deleteFileTool = defineTool("Delete", true, async (input, abortSignal, _callId, ctx) => {
+// ---- Delete (the shared mutation transaction preserves the original bytes) ----
+export const deleteFileTool = defineTool("Delete", true, async (input, signal, _callId, ctx) => {
 	if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
-	if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-	if (abortSignal?.aborted) return { output: "error: aborted" };
-	const pathHint = String(input.path);
-	let p: string;
+	if (typeof input?.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
 	try {
-		p = safePath(pathHint);
-	} catch (e) {
-		return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-	}
-
-	// Stat first so missing/dir/network hangs fail fast (not on readFile of whole tree).
-	let st: Awaited<ReturnType<typeof fs.stat>> | undefined;
-	try {
-		st = await withAbortTimeout(fs.stat(p), READ_STAT_MS, abortSignal, "stat");
-	} catch (e) {
-		const msg = e instanceof Error ? e.message : String(e);
-		if (msg.startsWith("timeout:") || msg.startsWith("aborted:")) {
-			return { output: `error: cannot access path (timed out or aborted): ${pathHint}` };
-		}
-		return { output: `error: ${pathHint} does not exist` };
-	}
-	if (st.isDirectory()) {
-		return { output: `error: path is a directory, not a file: ${pathHint}` };
-	}
-	if (abortSignal?.aborted) return { output: "error: aborted" };
-
-	// Optional undo snapshot — skip huge files so delete never hangs on a giant read.
-	let before = "";
-	if (st.size > 0 && st.size <= DELETE_BACKUP_MAX) {
-		try {
-			const readOpts = abortSignal ? { encoding: "utf8" as const, signal: abortSignal } : { encoding: "utf8" as const };
-			before = await withAbortTimeout(fs.readFile(p, readOpts), DELETE_IO_MS, abortSignal, "Delete backup");
-		} catch {
-			before = "";
-		}
-	}
-	if (abortSignal?.aborted) return { output: "error: aborted" };
-
-	try {
-		// fs.unlink has no AbortSignal in @types/node — race with withAbortTimeout.
-		await withAbortTimeout(fs.unlink(p), DELETE_IO_MS, abortSignal, "Delete");
-	} catch (e: any) {
-		const msg = e instanceof Error ? e.message : String(e);
-		if (msg.startsWith("timeout:") || msg.startsWith("aborted:")) {
-			return { output: `error: delete timed out or aborted (file locked or unreachable): ${pathHint}` };
-		}
-		if (e?.code === "ENOENT") return { output: `error: ${pathHint} does not exist` };
-		if (e?.code === "EISDIR" || e?.code === "EPERM" || e?.code === "EACCES" || e?.code === "EBUSY") {
-			return { output: `error: cannot delete ${pathHint}: ${e.code}` };
-		}
-		return { output: `error: cannot delete ${pathHint}: ${msg}` };
-	}
-	// Track as a change so the user can restore the deleted file.
-	try {
-		pendingChanges.record(pathHint, before, "", true);
-	} catch {
-		/* ignore undo-tracking failures */
-	}
-	return { output: `deleted ${pathHint}` };
+		return await mutateFile<ToolResult>(input.path, { signal, owner: ctx?.changeOwner }, (snapshot) => ({
+			data: null,
+			result: { output: snapshot.data === null ? `error: ${input.path} does not exist` : `deleted ${input.path}` },
+		}));
+	} catch (error) { return { output: `error: ${error instanceof Error ? error.message : String(error)}` }; }
 });
 
 // ---- EditNotebook ----
@@ -592,7 +432,7 @@ function nbStringToSource(s: string): string[] {
 	return lines.map((line, i) => (i < lines.length - 1 ? line + "\n" : line));
 }
 
-export const editNotebookTool = defineTool("EditNotebook", true, async (input, _signal, _callId, ctx) => {
+export const editNotebookTool = defineTool("EditNotebook", true, async (input, signal, _callId, ctx) => {
 	if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
 	const target = String(input?.target_notebook ?? "");
 	if (!target) return { output: "error: target_notebook is required" };
@@ -618,21 +458,23 @@ export const editNotebookTool = defineTool("EditNotebook", true, async (input, _
 		return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
 	}
 
+	try {
+		return await mutateFile<ToolResult>(abs, { signal, owner: ctx?.changeOwner }, async (snapshot) => {
 	// Read (or scaffold) the notebook JSON.
 	let nb: any;
-	let before = "";
+	const before = snapshot.data?.toString("utf8") ?? "";
 	try {
-		before = await fs.readFile(abs, "utf8");
+		if (snapshot.data === null) { const missing = new Error("notebook does not exist") as NodeJS.ErrnoException; missing.code = "ENOENT"; throw missing; }
 		nb = JSON.parse(before);
 	} catch (e: any) {
 		if (e?.code === "ENOENT" && isNew) {
 			nb = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 };
 		} else {
-			return { output: `error: cannot read notebook: ${e instanceof Error ? e.message : String(e)}` };
+			return { data: snapshot.data, result: { output: `error: cannot read notebook: ${e instanceof Error ? e.message : String(e)}` } };
 		}
 	}
 	if (!nb || typeof nb !== "object" || !Array.isArray(nb.cells)) {
-		return { output: "error: not a valid notebook (missing cells array)" };
+		return { data: snapshot.data, result: { output: "error: not a valid notebook (missing cells array)" } };
 	}
 
 	const cellType = nbCellType(language);
@@ -653,19 +495,19 @@ export const editNotebookTool = defineTool("EditNotebook", true, async (input, _
 	} else {
 		const cell = nb.cells[cellIdx];
 		if (!cell) {
-			return { output: `error: cell ${cellIdx} does not exist (notebook has ${nb.cells.length} cells)` };
+			return { data: snapshot.data, result: { output: `error: cell ${cellIdx} does not exist (notebook has ${nb.cells.length} cells)` } };
 		}
 		const src = nbSourceToString(cell.source);
 		if (oldString === "") {
-			return { output: "error: old_string is required when editing an existing cell (set is_new_cell=true to create one)" };
+			return { data: snapshot.data, result: { output: "error: old_string is required when editing an existing cell (set is_new_cell=true to create one)" } };
 		}
 		// old_string must uniquely identify the target text within the cell.
 		const first = src.indexOf(oldString);
 		if (first === -1) {
-			return { output: `error: old_string not found in cell ${cellIdx}` };
+			return { data: snapshot.data, result: { output: `error: old_string not found in cell ${cellIdx}` } };
 		}
 		if (src.indexOf(oldString, first + 1) !== -1) {
-			return { output: `error: old_string is not unique in cell ${cellIdx}; add more surrounding context` };
+			return { data: snapshot.data, result: { output: `error: old_string is not unique in cell ${cellIdx}; add more surrounding context` } };
 		}
 		const updated = src.slice(0, first) + newString + src.slice(first + oldString.length);
 		cell.source = nbStringToSource(updated);
@@ -684,11 +526,12 @@ export const editNotebookTool = defineTool("EditNotebook", true, async (input, _
 	}
 
 	const after = JSON.stringify(nb, null, 1) + "\n";
-	await fs.mkdir(path.dirname(abs), { recursive: true });
-	await fs.writeFile(abs, after, "utf8");
 
 	const action = isNew ? `Created ${cellType} cell at index ${Math.min(cellIdx, nb.cells.length - 1)}` : `Edited cell ${cellIdx}`;
-	return { output: `${action} in ${target}`, diff: makeDiff(abs, before, after) };
+	return { data: Buffer.from(after), result: { output: `${action} in ${target}`, diff: makeDiff(abs, before, after) } };
+		});
+	} catch (error) { return { output: `error: ${error instanceof Error ? error.message : String(error)}` }; }
+
 });
 
 // ---- ReadLints ----

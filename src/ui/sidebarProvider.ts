@@ -19,14 +19,14 @@ import { effectiveContextLength, ensureLoaded, isRunning, serverUrlFor } from ".
 import * as ollama from "../agent/ollama";
 import * as oauth from "../agent/oauth";
 import { recordUsage } from "../stores/usageStore";
-import { DEFAULT_APPROVAL, evaluateApproval, deniedSubject, actionTypeForCall, subjectFor, type ApprovalActionType, type ApprovalMode, type ApprovalPolicy } from "../agent/approvalPolicy";
+import { DEFAULT_APPROVAL, evaluateApproval, deniedSubject, actionTypeForCall, actionTypesForCall, subjectFor, type ApprovalActionType, type ApprovalMode, type ApprovalPolicy } from "../agent/approvalPolicy";
 import { stripModelScope, suggestPattern } from "./sidebar/approvalSuggest";
 import type { PendingApproval, RunSession } from "./sidebar/session";
 import { runHooks, runBlockingHooks } from "../integrations/hooksRunner";
 import { getWorkspaceRoot, safePath } from "../context/workspaceUtils";
 import { allPersonas, getPersona } from "../agent/personas";
 import { pendingChanges, computeHunks } from "../stores/pendingChanges";
-import { applyEvent, closeTrailingThinking, forceSettleOpenWork, parseMentionTokens, renderMentionTokens, type AgentEvent as SharedAgentEvent, type Turn } from "../shared/turns";
+import { applyEvent, closeTrailingThinking, forceSettleOpenWork, parseMentionTokens, renderMentionTokens, setQuestionAnswers, turnsToTranscript, type AgentEvent as SharedAgentEvent, type Turn } from "../shared/turns";
 import { resolveFileIcon, invalidateFileIconCache } from "./fileIcons";
 import {
   searchFilesAndFolders, searchCommits, searchDocSources, searchTerminals,
@@ -39,6 +39,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   /** One independent agent run per conversation, so chats run concurrently. */
   private _sessions = new Map<string, RunSession>();
+  private _deleting = new Set<string>();
+  private _titleAborts = new Map<string, AbortController>();
   private _currentMode: Mode = "agent";
   /** Shared debug/log output channel (View → Output → "OpenCursor"). */
   public static get log(): vscode.OutputChannel {
@@ -142,6 +144,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const cfgSub = this.featureStore.onDidChange(() => {
       this._sendConfigState();
       void this._handleFetchModels();
+      this._reevaluatePendingApprovals();
     });
     // Refresh the picker when OAuth accounts connect/disconnect.
     const oauthSub = oauth.onOAuthStatus(() => {
@@ -160,12 +163,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
+      try {
       switch (data.type) {
         case "ready":
           await this._sendInitialState();
           break;
         case "sendMessage":
           await this._handleMessage(data.text, data.attachments, {
+            convId: data.convId,
             fromIndex: data.fromIndex,
             model: data.model,
             mode: data.mode,
@@ -176,12 +181,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           // "Continue" button after hitting the step limit. Optionally flips
           // the global Auto Continue setting first.
           if (data.always) await this.featureStore.set({ autoContinue: true });
-          await this._handleMessage("Continue", undefined, {});
+          await this._handleMessage("Continue", undefined, { convId: data.convId, model: data.model, mode: data.mode });
           break;
         case "revertToMessage": {
           if (this._activeId && this._store.get(this._activeId)) {
-            if (data.revertFiles) await pendingChanges.rejectAll();
-            this._truncateConversation(this._activeId, data.index);
+            const convId = this._activeId;
+            const session = this._sessions.get(convId);
+            if (session) { this._cancelSession(convId); await session.done; }
+            if (data.revertFiles) await pendingChanges.rejectAll({ conversationId: convId, fromTurnIndex: data.index });
+            await this._truncateConversation(convId, data.index);
             this._sendConversations();
           }
           break;
@@ -263,12 +271,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                     b.name === "Task" || b.name === "task" || b.subStatus
                       ? (timedOut ? ("error" as const) : ("cancelled" as const))
                       : b.subStatus;
+                  // TodoWrite/Read: use "completed" instead of "error" to avoid red X
+                  const isTodo = b.name === "TodoWrite" || b.name === "TodoRead"
+                    || b.name === "todo_write" || b.name === "todo_read";
                   return {
                     ...b,
-                    status: "error" as const,
+                    status: isTodo ? "completed" as const : "error" as const,
                     result:
                       b.result ||
-                      (timedOut
+                      (isTodo ? "(todos: cancelled)" :
+                        timedOut
                         ? `(timeout after ${Math.round((b.timeoutMs || 0) / 1000)}s)`
                         : "(cancelled)"),
                     subStatus,
@@ -284,7 +296,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             const resultMsg = timedOut
               ? `(timeout after tool budget)`
               : "(cancelled)";
-            // Always push completed so webview spinner dies even if turns map missed.
+            // TodoWrite/Read: cancel/timeout should NOT show red X in UI.
+            // The "(cancelled)" string doesn't match parseTodos patterns, so
+            // status "error" + empty parse = red X + "(no todos)" which stops
+            // processing visually. Use "completed" for TodoWrite/Read.
+            const isTodo = toolName === "TodoWrite" || toolName === "TodoRead"
+              || toolName === "todo_write" || toolName === "todo_read";
             this._view?.webview.postMessage({
               type: "agentEvent",
               convId: cid,
@@ -292,8 +309,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 type: "tool-call-completed",
                 callId: data.callId,
                 name: toolName,
-                status: "error",
-                result: resultMsg,
+                status: isTodo ? "completed" : "error",
+                result: isTodo ? "(todos: cancelled)" : resultMsg,
               },
             });
             if (toolName === "Task" || toolName === "task") {
@@ -313,17 +330,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         case "resolveApproval":
           await this._resolveApproval(data);
           break;
-        case "answerQuestion": {
-          for (const s of this._sessions.values()) {
-            const resolve = s.pendingQuestions.get(data.callId);
-            if (resolve) {
-              s.pendingQuestions.delete(data.callId);
-              resolve(data.answers || {});
-              break;
-            }
-          }
+        case "answerQuestion":
+          this._answerQuestion(data.callId, data.answers || {});
           break;
-        }
         case "setMode":
           this._currentMode = data.mode;
           break;
@@ -400,6 +409,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           SidebarProvider.log.show(true);
           break;
       }
+      } catch (error) {
+        logError("sidebar.action", error, { action: data.type });
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`OpenCursor: ${message}`);
+        this._view?.webview.postMessage({ type: "error", convId: data.convId ?? this._activeId, message });
+      }
     });
   }
 
@@ -409,7 +424,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       changes: pendingChanges.list().map((c) => {
         let added = 0;
         let removed = 0;
-        for (const h of computeHunks(c.before, c.after)) {
+        for (const h of c.previewOnly ? [] : computeHunks(c.before, c.after)) {
           added += h.afterLines.length;
           removed += h.beforeLines.length;
         }
@@ -627,10 +642,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     await this._handleFetchModels();
   }
 
-  /** Persist a running session's authoritative turns immediately. */
+  /** Save both representations together so a reload can resume the visible work. */
   private _persistTurnsNow(convId: string, session: RunSession) {
     if (session.persistTimer) { clearTimeout(session.persistTimer); session.persistTimer = undefined; }
-    void this._store.update(convId, { turns: session.turns });
+    void this._store.update(convId, { turns: session.turns, steps: session.history, contextState: session.contextState });
   }
 
   /** Throttle persistence of live turns (~1/sec) during a run. */
@@ -638,7 +653,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (session.persistTimer) return;
     session.persistTimer = setTimeout(() => {
       session.persistTimer = undefined;
-      void this._store.update(convId, { turns: session.turns });
+      this._persistTurnsNow(convId, session);
     }, 800);
   }
 
@@ -657,7 +672,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
    * the caller with the new text/model. Steps align by counting user steps: keep
    * everything before the Nth user step, where N = user turns before `turnIndex`.
    */
-  private _truncateConversation(convId: string, turnIndex: number) {
+  private async _truncateConversation(convId: string, turnIndex: number) {
     const conv = this._store.get(convId);
     if (!conv) return;
     const turns = conv.turns.slice(0, turnIndex);
@@ -666,13 +681,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     let seen = 0;
     let cut = conv.steps.length;
     for (let i = 0; i < conv.steps.length; i++) {
-      if (conv.steps[i].kind === "user") {
+      const step = conv.steps[i];
+      if (step.kind === "user" && !step.synthetic) {
         if (seen === keepUserSteps) { cut = i; break; }
         seen++;
       }
     }
     const steps = conv.steps.slice(0, cut);
-    void this._store.update(convId, { turns, steps });
+    await this._store.update(convId, { turns, steps, contextState: undefined });
   }
 
   private _sendConversations() {
@@ -692,7 +708,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this._pendingPersonaId = personaId ?? features.activePersonaId;
     // Only create a fresh record when the active one already has messages.
     const active = this._activeId ? this._store.get(this._activeId) : undefined;
-    if (active && active.steps.length === 0) {
+    if (active && active.steps.length === 0 && !this._sessions.has(active.id)) {
       // Active conversation is already empty — reuse it; just set its persona.
       await this._store.update(active.id, { personaId: this._pendingPersonaId });
       this._view?.webview.postMessage({ type: "loadConversation", activeId: this._activeId, turns: [], personaId: this._pendingPersonaId });
@@ -725,17 +741,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this._activeId = id;
     await this._store.setActiveId(id);
     const features = this.featureStore.get();
-    this._view?.webview.postMessage({ type: "loadConversation", activeId: id, turns: this._turnsFor(id), personaId: conv.personaId ?? features.activePersonaId, usedTokens: conv.usedTokens });
+    this._view?.webview.postMessage({ type: "loadConversation", activeId: id, turns: this._turnsFor(id), personaId: conv.personaId ?? features.activePersonaId, usedTokens: conv.usedTokens, running: this._sessions.has(id) });
     this._sendConversations();
   }
 
   private async _deleteConversation(id: string) {
-    await this._store.delete(id);
-    if (this._activeId === id) {
-      this._activeId = undefined;
-      this._view?.webview.postMessage({ type: "loadConversation", activeId: undefined, turns: [] });
+    this._deleting.add(id);
+    try {
+      const session = this._sessions.get(id);
+      this._cancelSession(id);
+      if (session) await session.done;
+      await this._store.delete(id);
+      if (this._activeId === id) {
+        this._activeId = undefined;
+        this._view?.webview.postMessage({ type: "loadConversation", activeId: undefined, turns: [] });
+      }
+      this._sendConversations();
+    } finally {
+      this._deleting.delete(id);
     }
-    this._sendConversations();
   }
 
   /** Team list for the composer's Project-mode picker (member names resolved). */
@@ -779,6 +803,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return getPersona(personas, personaId).prompt;
   }
 
+  private _answerQuestion(callId: string, answers: Record<string, string[]>) {
+    for (const [convId, session] of this._sessions) {
+      const resolve = session.pendingQuestions.get(callId);
+      if (!resolve) continue;
+      session.pendingQuestions.delete(callId);
+      session.turns = setQuestionAnswers(session.turns, callId, answers);
+      this._persistTurnsNow(convId, session);
+      this._view?.webview.postMessage({ type: "questionAnswered", convId, callId, answers });
+      resolve(answers);
+      return;
+    }
+  }
+
   /** Await the user's answers to an ask_question wizard (resolved by the webview). */
   private _askUser(session: RunSession, callId: string, signal?: AbortSignal): Promise<Record<string, string[]>> {
     return new Promise((resolve, reject) => {
@@ -788,15 +825,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         reject(err);
         return;
       }
-      session.pendingQuestions.set(callId, resolve);
-      signal?.addEventListener("abort", () => {
+      const onAbort = () => {
         if (session.pendingQuestions.has(callId)) {
           session.pendingQuestions.delete(callId);
           const err = new Error("cancelled");
           err.name = "AbortError";
           reject(err);
         }
+      };
+      session.pendingQuestions.set(callId, (answers) => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(answers);
       });
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 
@@ -804,7 +845,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private async _approveTool(convId: string, session: RunSession, toolName: string, input: any, callId?: string): Promise<boolean | { approved: false; blockedSubject: string }> {
     const decision = this._evaluatePolicy(toolName, input);
     if (decision === "allow") return true;
-    const type = actionTypeForCall(toolName, input, getWorkspaceRoot())!;
+    const policy = this._approvalPolicy();
+    const applicable = actionTypesForCall(toolName, input, getWorkspaceRoot());
+    const permissive = Object.fromEntries(Object.keys(DEFAULT_APPROVAL).map((key) => [key, { mode: "allow", allowlist: [], denylist: [] }])) as unknown as ApprovalPolicy;
+    const type = applicable.find((key) => evaluateApproval({ ...permissive, [key]: policy[key] }, toolName, input, getWorkspaceRoot()) === "ask")
+      ?? actionTypeForCall(toolName, input, getWorkspaceRoot())!;
     if (decision === "deny") {
       // Report the chained command that actually tripped the rule, not the first
       // one on the line (`git add -A; git commit` must name `git commit`).
@@ -834,13 +879,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       toolName,
       actionType: type,
       subject,
-      detail,
+      detail: type !== "outside" && applicable.includes("outside") ? `${detail} (outside workspace: ${subjectFor("outside", toolName, input)})` : detail,
       suggestion: suggestPattern(type, toolName, subject),
       input,
     };
     return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const onAbort = () => settle(false);
       const settle = (ok: boolean) => {
-        if (!session.pendingApprovals.has(info.requestId)) return;
+        if (settled) return;
+        settled = true;
+        session.abort.signal.removeEventListener("abort", onAbort);
         session.pendingApprovals.delete(info.requestId);
         this._view?.webview.postMessage({ type: "approvalResolved", convId, requestId: info.requestId, approved: ok });
         resolve(ok);
@@ -848,8 +897,22 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       session.pendingApprovals.set(info.requestId, { info, resolve: settle });
       this._view?.webview.postMessage({ type: "approvalRequest", convId, request: info });
       // Cancelling the run denies anything still pending.
-      session.abort.signal.addEventListener("abort", () => settle(false));
+      if (session.abort.signal.aborted) settle(false);
+      else session.abort.signal.addEventListener("abort", onAbort, { once: true });
     });
+  }
+
+  /**
+   * A policy change from the Settings panel (e.g. switching to "Allow") must
+   * settle prompts that were already raised, not just future ones.
+   */
+  private _reevaluatePendingApprovals() {
+    for (const session of this._sessions.values()) {
+      for (const p of [...session.pendingApprovals.values()]) {
+        const decision = this._evaluatePolicy(p.info.toolName, p.info.input);
+        if (decision !== "ask") p.resolve(decision === "allow");
+      }
+    }
   }
 
   /** The effective approval policy (user settings over safe defaults). */
@@ -926,6 +989,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   /** Whether a model id maps to a managed local llama.cpp model. */
   private _localModel(modelId: string) {
+    const scope = modelId.includes("::") ? modelId.slice(0, modelId.indexOf("::")) : undefined;
+    if (scope && scope !== "llamacpp") return undefined;
     const bare = stripModelScope(modelId);
     return this.featureStore.get().llamacppModels.find((m) => m.id === modelId || m.id === bare);
   }
@@ -950,7 +1015,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       ? (scopedProvider.slice("__oauth__:".length) as oauth.OAuthKind)
       : scopedProvider && (["claude-code", "codex", "antigravity"] as string[]).includes(scopedProvider)
         ? (scopedProvider as oauth.OAuthKind)
-        : undefined) ?? this._oauthModelKind.get(modelId);
+        : undefined) ?? (!scopedProvider ? this._oauthModelKind.get(modelId) : undefined);
     if (oauthKind) {
 
       return { baseUrl: "", apiKey: "", model: modelId, anthropic: false, providerId: oauthKind, oauthKind };
@@ -958,19 +1023,22 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     // Local llama.cpp model: served by the extension's own server, no provider
     // entry required. Ensure it's loaded, then point at its local /v1 endpoint.
     const local = features.llamacppModels.find((m) => m.id === modelId);
-    if (local) {
+    if (local && (!scopedProvider || scopedProvider === "llamacpp")) {
       if (opts?.load) await ensureLoaded(local, features.llamacppConfig);
       // llama-server's /v1 serves the loaded model regardless of the id sent,
       // but pass the gguf basename so logs/aliases line up.
       return { baseUrl: serverUrlFor(local, features.llamacppConfig), apiKey: "", model: local.file || modelId, anthropic: false, providerId: "llamacpp" };
     }
     // Locally-pulled Ollama model: served by the daemon's /v1, no provider entry.
-    if (this._ollamaModelIds.has(modelId)) {
+    if ((!scopedProvider || scopedProvider === "ollama") && this._ollamaModelIds.has(modelId)) {
       return { baseUrl: ollama.ollamaOpenAIBase(), apiKey: "", model: modelId, anthropic: false, providerId: "ollama" };
     }
     // 0) Provider-scoped composite id → route to that exact provider.
     let prov: ProviderConfig | undefined;
-    if (scopedProvider) prov = enabled.find((p) => p.id === scopedProvider);
+    if (scopedProvider) {
+      prov = enabled.find((p) => p.id === scopedProvider);
+      if (!prov) throw new Error(`Selected provider "${scopedProvider}" is unavailable or disabled. Select an enabled provider.`);
+    }
     // 1) Catalog/custom model → its tagged provider, else first of matching kind.
     const def = this.featureStore.allModels().find((m) => m.id === modelId);
     if (!prov && def) {
@@ -998,7 +1066,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _contextTokensFor(modelId: string, oauthKind?: string): number {
     const f = this.featureStore.get();
     const bare = stripModelScope(modelId);
-    const m = f.llamacppModels.find((x) => x.id === modelId || x.id === bare);
+    const m = this._localModel(modelId);
     if (m) return effectiveContextLength(m, f.llamacppContextLength);
     const opt = this.featureStore.optionsFor(bare, oauthKind).find((o) => o.key === "max_context")?.value;
     return parseContextLabel(opt) || 128_000;
@@ -1008,8 +1076,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _buildModelList(fetched: { providerId: string; ids: string[] }[]): ModelDef[] {
     const features = this.featureStore.get();
     const enabled = this._enabledProviders();
-    // enabledModels is the authoritative allow-list. Catalog models are enabled by
-    // default; any other provider model stays disabled until the user enables it.
+    // Saved choices include explicitly enabled models. Newly shipped catalog
+    // defaults also appear; any explicit disabledModels entry takes precedence.
     // Empty set = legacy/fresh config → fall back to "all catalog enabled".
     const enabledSet = new Set(features.enabledModels.length ? features.enabledModels : this.featureStore.allModels().filter((m) => m.enabled !== false).map((m) => m.id));
     // Only catalog models enabled by default count as auto-on for fetched/OAuth ids.
@@ -1025,7 +1093,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     // Catalog/default models served by an enabled provider of matching kind.
     for (const m of this.featureStore.allModels()) {
       // Catalog models default-on; only filter when explicitly disabled.
-      if (disabledSet.has(m.id) || !enabledSet.has(m.id)) continue;
+      if (disabledSet.has(m.id) || (!enabledSet.has(m.id) && !catalogIds.has(m.id))) continue;
       // Custom models tagged to a specific provider route there; else by kind.
       // Catalog models only match popular (built-in) providers — a custom
       // "OpenAI-compatible" endpoint serves its own fetched models, not the catalog.
@@ -1137,7 +1205,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const judgeIsLocal = !!this._localModel(judge);
       if (judgeIsLocal && !isRunning(stripModelScope(judge))) return candidates[0];
       if (!jprov.oauthKind && !jprov.baseUrl) return candidates[0]; // unroutable judge
-      const picked = await pickModel(jprov.baseUrl, jprov.apiKey, jprov.model, candidates, task, jprov.anthropic, jprov.oauthKind);
+      const picked = await pickModel(jprov.baseUrl, jprov.apiKey, jprov.model, candidates, task, jprov.anthropic, jprov.oauthKind, {
+        onUsage: (event) => {
+          if (this.featureStore.get().trackUsage !== false) void recordUsage(event.model ?? jprov.model, event.promptTokens ?? 0, event.completionTokens ?? 0, event);
+        },
+      });
       if (picked && candidates.includes(picked)) return picked;
       // Judge may reply with a bare model id (no provider scope) — match it.
       const scoped = candidates.find((c) => stripModelScope(c) === stripModelScope(picked));
@@ -1267,11 +1339,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private async _handleMessage(
     text: string,
     attachments?: Attachment[],
-    edit?: { fromIndex?: number; model?: string; mode?: string; revertFiles?: boolean },
+    edit?: { convId?: string | null; fromIndex?: number; model?: string; mode?: string; revertFiles?: boolean },
   ) {
     if (!text.trim() && (!attachments || attachments.length === 0)) {
       vscode.window.showWarningMessage("OpenCursor: Message cannot be empty");
       return;
+    }
+
+    // Capture routing before any asynchronous work; switching tabs cannot retarget a send.
+    let convId = edit?.convId !== undefined ? edit.convId ?? undefined : this._activeId;
+    const selectedAtSubmit = this._activeId;
+    const submittedMode = (edit?.mode ?? this._currentMode) as Mode;
+    const submittedModel = edit?.model ?? this.settingsManager.getSettings().model;
+    if (convId && (this._deleting.has(convId) || !this._store.get(convId))) return;
+    const existing = convId ? this._sessions.get(convId) : undefined;
+    if (existing) {
+      if (!existing.settled) this._cancelSession(convId!);
+      await existing.done;
+      if (this._deleting.has(convId!)) return;
     }
 
     // Mentions live IN the text as self-contained tokens "@[kind:name](path)",
@@ -1285,30 +1370,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         summarize: (convId) => {
           const conv = this._store.get(convId);
           if (!conv) return undefined;
-          return conv.turns
-            .map((t: any) => `${t.role === "user" ? "User" : "Assistant"}: ${(t.text || "").slice(0, 600)}`)
-            .join("\n")
-            .slice(0, 6000);
+          return turnsToTranscript(conv.turns, 6000);
         },
       }).catch(() => "");
     }
 
     // Editing an earlier message: truncate persisted turns + model history to
     // that point, and optionally revert still-pending file edits made after it.
-    if (edit?.fromIndex != null && this._activeId && this._store.get(this._activeId)) {
-      if (edit.revertFiles) await pendingChanges.rejectAll();
-      this._truncateConversation(this._activeId, edit.fromIndex);
+    if (edit?.fromIndex != null && convId && this._store.get(convId)) {
+      if (edit.revertFiles) await pendingChanges.rejectAll({ conversationId: convId, fromTurnIndex: edit.fromIndex });
+      await this._truncateConversation(convId, edit.fromIndex);
     }
-    // Per-message model/mode overrides (from an edited bubble) take precedence.
-    if (edit?.model) {
-      const s = this.settingsManager.getSettings();
-      s.model = edit.model;
-      await this.settingsManager.saveSettings(s);
-    }
-    if (edit?.mode) this._currentMode = edit.mode as Mode;
-
     const settings = this.settingsManager.getSettings();
-    let modelId = settings.model;
+    let modelId = submittedModel;
     // Auto mode is hidden for now; a lingering "auto" selection (or empty)
     // resolves to the first enabled model. (Judge-based routing kept in
     // _resolveAutoModel for when Auto returns.)
@@ -1324,33 +1398,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       vscode.window.showErrorMessage("OpenCursor: Missing API key. Please open settings to add one.");
       this._view?.webview.postMessage({
         type: "error",
+        convId,
         message: "Missing API Key. Provide it in Settings.",
       });
       return;
     }
 
-    // Ensure there is an active conversation backing this run.
-    if (!this._activeId || !this._store.get(this._activeId)) {
+    // A new chat gets its record once; existing/background sends retain their target.
+    const created = !convId;
+    if (!convId) {
       const features = this.featureStore.get();
       const personaId = this._pendingPersonaId ?? features.activePersonaId;
       const conv = await this._store.create(personaId);
-      this._activeId = conv.id;
+      convId = conv.id;
+      if (this._activeId === selectedAtSubmit) this._activeId = conv.id;
       this._pendingPersonaId = undefined;
-    }
-    // Bind this run to a fixed conversation id; switching chats must not affect it.
-    const convId = this._activeId;
-    // A run is already in flight (e.g. "send now" on a queued message): abort it
-    // and wait for its `finally` to clear the session, then start this run.
-    const existing = this._sessions.get(convId);
-    if (existing) {
-      existing.abort.abort();
-      for (let i = 0; i < 100 && this._sessions.has(convId); i++) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      if (this._sessions.has(convId)) {
-        vscode.window.showWarningMessage("OpenCursor: This chat is already running.");
-        return;
-      }
     }
     const isFirstMessage = (this._store.get(convId)?.steps.length ?? 0) === 0;
     if (isFirstMessage) {
@@ -1358,31 +1420,39 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       await this._store.update(convId, { title: fallback });
     }
     const history = this._store.get(convId)?.steps ?? [];
+    const contextState = this._store.get(convId)?.contextState ?? {};
 
     // Host owns the authoritative UI turns: seed from persisted turns + this
     // user message, then accumulate streamed events below. The webview is just a
     // renderer, so closing/moving/reopening it never loses or breaks the run.
     const seededTurns: Turn[] = [
       ...(this._store.get(convId)?.turns ?? []),
-      { role: "user" as const, text, attachments: attachments?.length ? (attachments as any) : undefined, model: settings.model, mode: this._currentMode },
+      { role: "user" as const, text, attachments: attachments?.length ? (attachments as any) : undefined, model: modelId, mode: submittedMode },
     ];
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => { resolveDone = resolve; });
     const session: RunSession = {
+      done, resolveDone,
       abort: new AbortController(),
       subagentAborts: new Map(),
       pendingQuestions: new Map(),
       pendingApprovals: new Map(),
       turns: seededTurns,
+      history,
+      contextState,
     };
     this._sessions.set(convId, session);
 
     const features = this.featureStore.get();
-    const mode = this._currentMode;
+    const mode = submittedMode;
     // beforeSubmit hooks may veto the prompt entirely.
     {
-      const veto = await runBlockingHooks(features.hooks, "beforeSubmit", { prompt: text });
-      if (veto) {
+      const veto = await runBlockingHooks(features.hooks, "beforeSubmit", { prompt: text }, undefined, session.abort.signal);
+      if (veto || session.abort.signal.aborted) {
         this._sessions.delete(convId);
-        vscode.window.showWarningMessage(`OpenCursor: prompt blocked by hook — ${veto}`);
+        session.resolveDone();
+        this._view?.webview.postMessage({ type: "agentEvent", convId, event: { type: "run-status", status: "cancelled" } });
+        if (!session.abort.signal.aborted) vscode.window.showWarningMessage(`OpenCursor: prompt blocked by hook — ${veto}`);
         return;
       }
     }
@@ -1412,6 +1482,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const scheduleUi = () => {
       if (!uiTimer) uiTimer = setTimeout(flushUi, 16);
     };
+    let finalStatus: "finished" | "cancelled" | "error" = "finished";
     const emit = (event: AgentEvent) => {
       if (event.type === "error") {
         SidebarProvider.log.appendLine(`[${new Date().toISOString()}] [agent] ${event.message}`);
@@ -1500,6 +1571,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
       if (ev.type === "run-status") {
         if (ev.status === "finished" || ev.status === "cancelled" || ev.status === "error") {
+          session.settled = true;
+          finalStatus = ev.status;
           session.turns = forceSettleOpenWork(
             closeTrailingThinking(session.turns),
             ev.status === "error" ? "error" : "cancelled",
@@ -1514,10 +1587,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       } else if (ev.type === "usage") {
         // Persist cumulative per-model token usage (Usage & Quota page).
         if (this.featureStore.get().trackUsage !== false) {
-          void recordUsage(stripModelScope(modelId), ev.promptTokens, ev.completionTokens);
+          void recordUsage(ev.model ?? stripModelScope(modelId), ev.promptTokens, ev.completionTokens, ev);
         }
         // Persist per-conversation context consumption (composer ring after reload).
-        void this._store.update(convId, { usedTokens: ev.totalTokens });
+        if (!ev.source || ev.source === "parent") void this._store.update(convId, { usedTokens: ev.totalTokens });
       } else if (ev.type !== "run-result" && ev.type !== "mode-changed" && ev.type !== "shell-notify") {
         session.turns = applyEvent(session.turns, ev);
         this._schedulePersistTurns(convId, session);
@@ -1526,11 +1599,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     };
 
     // Surface the (possibly new) conversation in the tab bar immediately.
-    await this._store.setActiveId(convId);
+    if (this._activeId === convId) await this._store.setActiveId(convId);
     this._sendConversations();
 
     try {
-      this._view?.webview.postMessage({ type: "runStarted", convId, prompt: text });
+      this._view?.webview.postMessage({ type: "runStarted", convId, prompt: text, created, turns: session.turns });
 
       // Local model not yet running → boot it now, showing a loading state in the
       // chat (selecting a model never loads it; only sending a message does).
@@ -1554,14 +1627,29 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       // Generate a short AI title once the provider/server is ready (local
       // models aren't reachable until booted above, so this must run here).
       if (isFirstMessage && text.trim() && features.autoGenerateTitles !== false) {
-        generateTitle(prov.baseUrl, apiKey, prov.model, text, prov.anthropic, prov.oauthKind)
+        this._titleAborts.get(convId)?.abort();
+        const titleAbort = new AbortController();
+        this._titleAborts.set(convId, titleAbort);
+        const abortTitle = () => titleAbort.abort();
+        if (session.abort.signal.aborted) abortTitle();
+        else session.abort.signal.addEventListener("abort", abortTitle, { once: true });
+        generateTitle(prov.baseUrl, apiKey, prov.model, text, prov.anthropic, prov.oauthKind, {
+          signal: titleAbort.signal,
+          onUsage: (event) => {
+            if (this.featureStore.get().trackUsage !== false) void recordUsage(event.model ?? prov.model, event.promptTokens ?? 0, event.completionTokens ?? 0, event);
+          },
+        })
           .then(async (title) => {
             if (title && this._store.get(convId)) {
               await this._store.update(convId, { title });
               this._sendConversations();
             }
           })
-          .catch((error) => logError("title.generate", error, { conversationId: convId }));
+          .catch((error) => logError("title.generate", error, { conversationId: convId }))
+          .finally(() => {
+            session.abort.signal.removeEventListener("abort", abortTitle);
+            if (this._titleAborts.get(convId) === titleAbort) this._titleAborts.delete(convId);
+          });
       }
 
       await runAgent({
@@ -1576,6 +1664,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         prompt: mentionContext ? `${text}\n\n${mentionContext}` : text,
         attachments,
         history,
+        contextState,
+        changeOwner: { conversationId: convId, runId: `run_${Date.now()}_${Math.random().toString(36).slice(2)}`, turnIndex: seededTurns.length - 1 },
+        promptCacheKey: convId,
         maxTokens: settings.maxResponseLength > 0 ? settings.maxResponseLength : undefined,
         maxSteps: features.maxAgentSteps > 0 ? features.maxAgentSteps : undefined,
         autoContinue: features.autoContinue === true,
@@ -1595,6 +1686,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         activeTeamIds: features.activeTeamIds,
         subagentModel: features.subagentModel,
         availableModels: this._modelsForProvider(prov.providerId, prov.oauthKind),
+        resolveModelOptions: (childModel) => {
+          const kind = prov.oauthKind ?? features.providers.find((p) => p.id === prov.providerId)?.kind;
+          return {
+            contextTokens: this._contextTokensFor(childModel, kind),
+            modelParams: optionsToParams(this.featureStore.optionsFor(childModel, kind)),
+            maxTokens: settings.maxResponseLength > 0 ? settings.maxResponseLength : undefined,
+          };
+        },
         registerSubagentAbort: (callId, abort) => {
           // Chain aborts (tool kill + nested Task child) so timeout fires both.
           const prev = session.subagentAborts.get(callId);
@@ -1605,9 +1704,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         },
         askUser: (callId, _header, _questions, sig) => this._askUser(session, callId, sig),
         onAfterRun: () => runHooks(features.hooks, "afterRun", { prompt: text }),
-        onBeforeShell: (command) => runBlockingHooks(features.hooks, "beforeShell", { command }),
+        onBeforeShell: (command, hookSignal) => runBlockingHooks(features.hooks, "beforeShell", { command }, undefined, hookSignal ?? session.abort.signal),
         onAfterEdit: (path) => runHooks(features.hooks, "afterEdit", { path }),
-        onHook: (event, context, tool) => runBlockingHooks(features.hooks, event, context, tool),
+        onHook: (event, context, tool, hookSignal) => runBlockingHooks(features.hooks, event, context, tool, hookSignal ?? session.abort.signal),
         signal: session.abort.signal,
         emit,
       });
@@ -1634,25 +1733,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           session.pendingQuestions.delete(qid);
           try { resolve({}); } catch { /* ignore */ }
         }
-        for (const [rid, p] of session.pendingApprovals) {
-          session.pendingApprovals.delete(rid);
+        for (const p of [...session.pendingApprovals.values()]) {
           try { p.resolve(false); } catch { /* ignore */ }
-          this._view?.webview.postMessage({ type: "approvalResolved", convId, requestId: rid, approved: false });
         }
         // Only force-close still-open work; leave completed tools alone.
         session.turns = forceSettleOpenWork(closeTrailingThinking(session.turns), "cancelled");
         if (session.persistTimer) { clearTimeout(session.persistTimer); session.persistTimer = undefined; }
-        await this._store.update(convId, { turns: session.turns, steps: history });
+        await this._store.update(convId, { turns: session.turns, steps: history, contextState });
       } catch (e: unknown) {
         logError("agent.cleanup", e, { conversationId: convId });
       } finally {
         this._sessions.delete(convId);
+        session.resolveDone();
         this._sendConversations();
         // Guarantee webview leaves "Working" even if run-status was lost (IDE reopen, stuck subagent).
         this._view?.webview.postMessage({
           type: "agentEvent",
           convId,
-          event: { type: "run-status", status: session.abort.signal.aborted ? "cancelled" : "finished" },
+          event: { type: "run-status", status: session.abort.signal.aborted ? "cancelled" : finalStatus },
         });
       }
     }
@@ -1663,6 +1761,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
    * approvals/questions, and force-settled UI. Safe to call repeatedly.
    */
   private _cancelSession(convId: string): void {
+    this._titleAborts.get(convId)?.abort();
     const session = this._sessions.get(convId);
     if (!session) {
       // Stale UI "Working" with no live session (e.g. after IDE reopen mid-run).
@@ -1680,10 +1779,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       session.pendingQuestions.delete(qid);
       try { resolve({}); } catch { /* ignore */ }
     }
-    for (const [rid, p] of session.pendingApprovals) {
-      session.pendingApprovals.delete(rid);
+    for (const p of [...session.pendingApprovals.values()]) {
       try { p.resolve(false); } catch { /* ignore */ }
-      this._view?.webview.postMessage({ type: "approvalResolved", convId, requestId: rid, approved: false });
     }
     session.turns = forceSettleOpenWork(closeTrailingThinking(session.turns), "cancelled");
     this._persistTurnsNow(convId, session);

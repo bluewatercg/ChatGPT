@@ -12,28 +12,10 @@ import type { Step } from "./types";
 /**
  * Context helpers for the agent loop.
  *
- * Tool results and edit args stay verbatim for the full run. History is only
- * reduced by auto-summarization (when the window is nearly full) or by
- * `fitStepsToBudget` dropping whole call groups as a last resort. Thinking is
- * UI-only and is stripped before the model wire.
+ * Thinking is UI-only and stripped before the model wire. Tool archives and
+ * summarization reduce the working context; budget fitting remains the final
+ * safety pass. The full transcript is kept separately from these model copies.
  */
-
-/** Edit / durable tools — preferred when budget-fitting must drop groups. */
-const PROTECTED_RESULTS = new Set([
-  "TodoWrite",
-  "TodoRead",
-  "Task",
-  "AskQuestion",
-  "SwitchMode",
-  "WritePlan",
-  "StrReplace",
-  "Write",
-  "Delete",
-  "EditNotebook",
-]);
-
-/** Edit payloads — same protection class for budget selection. */
-const SLIM_ARGS = new Set(["StrReplace", "Write", "EditNotebook", "Delete"]);
 
 /** A rendered image costs far more than its base64 length suggests. */
 const IMAGE_TOKENS = 1300;
@@ -43,17 +25,27 @@ export function stepTokens(s: Step): number {
   let chars = 0;
   if (s.kind === "user") {
     chars += s.text.length;
-    for (const a of s.attachments || []) chars += a.kind === "image" ? 0 : a.data?.length || 0;
+    if (s.context && !s.synthetic) {
+      chars += (s.context.omitUserInfo ? 0 : s.context.userInfo.length) +
+        (s.context.omitOpenFiles ? 0 : s.context.openFiles.length) +
+        s.context.timestamp.length + (s.context.reminder?.length || 0) + 66;
+    }
+    for (const a of s.attachments || []) {
+      if (a.kind === "text") chars += (a.data?.length || 0) + a.name.length + 42;
+    }
+    if (s.synthetic) chars += 38;
     const imgs = (s.attachments || []).filter((a) => a.kind === "image").length;
     return Math.ceil(chars / 4) + imgs * IMAGE_TOKENS + 4;
   }
   if (s.kind === "assistant") {
     // thinking is UI-only — never sent on the wire (see buildMessages).
     chars += s.text?.length || 0;
-    for (const c of s.calls || []) chars += (c.arguments?.length || 0) + (c.name?.length || 0) + 8;
+    for (const c of s.calls || []) {
+      chars += (c.arguments?.length || 0) + (c.thoughtSignature?.length || 0) + c.name.length + c.id.length + 48;
+    }
     return Math.ceil(chars / 4) + 4;
   }
-  chars += s.output?.length || 0;
+  chars += (s.output?.length || 0) + s.callId.length;
   return Math.ceil(chars / 4) + (s.image ? IMAGE_TOKENS : 0) + 4;
 }
 
@@ -66,7 +58,7 @@ function lastUserIndex(steps: Step[]): number {
   for (let i = steps.length - 1; i >= 0; i--) {
     if (steps[i].kind === "user") return i;
   }
-  return 0;
+  return -1;
 }
 
 /** Index of the last real (non-synthetic) user message — the actual request. */
@@ -86,8 +78,8 @@ export function currentRequestText(steps: Step[]): string {
 }
 
 /**
- * Start of a recent-token window (newest-first). Used by compaction splits;
- * no longer used to decide what to prune — pruning is gone.
+ * Start of a recent-token window (newest-first). Callers retaining tool history
+ * must also respect whole call/result groups.
  */
 export function recentWindowStart(steps: Step[], keepTokens: number): number {
   let used = 0;
@@ -109,8 +101,8 @@ function stripThinking(steps: Step[]): void {
 }
 
 /**
- * Prepare history for the model wire. Content stays full — no stubs, no
- * supersede marks, no slimmed edit args. Only thinking is dropped (UI-only).
+ * Strip UI-only reasoning. Payload reduction belongs to the tool archive,
+ * where an omitted body has a recoverable location, rather than blind pruning.
  */
 export function economizeHistory(steps: Step[], _opts?: { keepRecentTokens?: number }): { prunedResults: number; slimmedCalls: number } {
   stripThinking(steps);
@@ -118,21 +110,10 @@ export function economizeHistory(steps: Step[], _opts?: { keepRecentTokens?: num
 }
 
 /**
- * Budget-fit prep. Formerly hard-pruned dumps; now a no-op on content so
- * `fitStepsToBudget` can drop whole groups with full fidelity still intact.
+ * Budget-fit prep. Actual content fitting happens in fitStepsToBudget.
  */
 export function economizeHistoryHard(steps: Step[], _opts?: { keepRecentTokens?: number }): void {
   stripThinking(steps);
-}
-
-/** True if a step is durable task state that budget-trim must prefer to keep. */
-export function isProtectedStep(s: Step): boolean {
-  if (s.kind === "user") return true;
-  if (s.kind === "assistant") {
-    if ((s.text || "").trim()) return true;
-    return (s.calls || []).some((c) => PROTECTED_RESULTS.has(c.name) || SLIM_ARGS.has(c.name));
-  }
-  return PROTECTED_RESULTS.has(s.name);
 }
 
 /** Hard safety trigger. Normal compaction waits for a semantic boundary. */
@@ -142,10 +123,10 @@ export const COMPACT_AT_FILL = 0.92;
 export const COMPACT_SOFT_FILL = 0.85;
 
 /**
- * After summarize, keep this fraction of budget as verbatim tail. Higher =
- * more recent tool results survive compaction intact.
+ * Target fraction of budget retained as recent context after summarization.
+ * The loop additionally caps this target at 24k tokens for large windows.
  */
-export const COMPACT_KEEP_FRAC = 0.55;
+export const COMPACT_KEEP_FRAC = 0.35;
 
 /** Skip compaction unless the summarized prefix frees at least this much budget. */
 export const COMPACT_MIN_GAIN_FRAC = 0.15;

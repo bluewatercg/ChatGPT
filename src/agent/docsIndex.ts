@@ -15,7 +15,7 @@
 
 import * as fs from "fs/promises";
 import * as path from "path";
-import { embedTexts, embedQuery } from "./semanticIndex";
+import { embedTexts, embedQuery, getEmbedFingerprint } from "./semanticIndex";
 
 export interface DocSource {
   id: string;
@@ -38,6 +38,7 @@ interface DocChunk {
   vec: number[];
 }
 interface DocIndexFile {
+  fingerprint: string;
   chunks: DocChunk[];
 }
 
@@ -235,6 +236,7 @@ function chunkText(text: string): string[] {
  */
 export async function indexDocSource(doc: DocSource): Promise<{ pages: number; chunks: number }> {
   if (!storageDir) throw new Error("docs storage not initialised");
+  const fingerprint = getEmbedFingerprint();
   emit({ indexing: doc.id, done: 0, total: 1, error: undefined });
   docLogs.set(doc.id, []);
   log(doc.id, `Indexing "${doc.name}" — start URL: ${doc.url}`);
@@ -281,7 +283,8 @@ export async function indexDocSource(doc: DocSource): Promise<{ pages: number; c
         log(doc.id, `OK   ${url} — "${title || doc.name}", ${pieces.length} chunks`);
         if (pieces.length) {
           const vecs = await embedTexts(pieces);
-          if (!vecs) {
+          if (getEmbedFingerprint() !== fingerprint) throw new Error("Embedding configuration changed during indexing; retry this source.");
+          if (!vecs || vecs.length !== pieces.length || vecs.some((v) => !Array.isArray(v) || !v.length || !v.every(Number.isFinite))) {
             log(doc.id, `FAIL embedding ${pieces.length} chunks — check the embedding model`);
             throw new Error("embedding failed — check the embedding model in Codebase Indexing");
           }
@@ -310,7 +313,13 @@ export async function indexDocSource(doc: DocSource): Promise<{ pages: number; c
     if (pages === 0) throw new Error(firstError || "no pages could be fetched");
 
     await fs.mkdir(storageDir, { recursive: true });
-    await fs.writeFile(fileFor(doc.id), JSON.stringify({ chunks } satisfies DocIndexFile), "utf8");
+    if (getEmbedFingerprint() !== fingerprint) throw new Error("Embedding configuration changed during indexing; retry this source.");
+    const destination = fileFor(doc.id);
+    const temp = `${destination}.${Math.random().toString(36).slice(2)}.tmp`;
+    try {
+      await fs.writeFile(temp, JSON.stringify({ fingerprint, chunks } satisfies DocIndexFile), "utf8");
+      await fs.rename(temp, destination);
+    } finally { await fs.rm(temp, { force: true }).catch(() => {}); }
     log(doc.id, `Done: ${pages} pages, ${chunks.length} chunks indexed`);
     emit({ indexing: undefined, done: pages, total: pages, error: undefined });
     return { pages, chunks: chunks.length };
@@ -338,8 +347,10 @@ export async function searchDocs(
   } catch {
     return [];
   }
+  const fingerprint = getEmbedFingerprint();
+  if (idx.fingerprint !== fingerprint) throw new Error("Documentation index uses a different embedding configuration. Reindex this source in Settings.");
   const qv = await embedQuery(query);
-  if (!qv || !idx.chunks.length) return [];
+  if (!qv || !idx.chunks.length || getEmbedFingerprint() !== fingerprint) return [];
   const scored = idx.chunks
     .filter((c) => c.vec.length === qv.length)
     .map((c) => {

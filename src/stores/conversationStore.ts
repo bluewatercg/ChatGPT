@@ -10,6 +10,7 @@
 import * as vscode from "vscode";
 import type { Step } from "../agent/types";
 import type { Turn } from "../shared/turns";
+import type { ContextState } from "../agent/contextState";
 
 export interface Conversation {
   id: string;
@@ -17,6 +18,7 @@ export interface Conversation {
   createdAt: number;
   updatedAt: number;
   steps: Step[];
+  contextState?: ContextState;
   /** Authoritative UI turns, owned by the host and persisted for rendering. */
   turns: Turn[];
   /** Persona/preset this conversation uses. */
@@ -103,7 +105,7 @@ export class ConversationStore {
     return conv;
   }
 
-  async update(id: string, patch: Partial<Pick<Conversation, "steps" | "turns" | "title" | "personaId" | "usedTokens">>): Promise<void> {
+  async update(id: string, patch: Partial<Pick<Conversation, "steps" | "contextState" | "turns" | "title" | "personaId" | "usedTokens">>): Promise<void> {
     const list = this.all();
     const i = list.findIndex((c) => c.id === id);
     if (i === -1) return;

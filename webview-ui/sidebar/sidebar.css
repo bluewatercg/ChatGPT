@@ -1554,6 +1554,34 @@ body {
 	outline: none;
 	border-color: var(--accent);
 }
+.qc-structured {
+	margin-top: 4px;
+}
+.qc-input,
+.qc-textarea {
+	width: 100%;
+	background: var(--bg-dark);
+	border: 1px solid var(--border-soft);
+	color: var(--fg);
+	border-radius: 7px;
+	padding: 8px 10px;
+	font-size: 12.5px;
+	font-family: inherit;
+	box-sizing: border-box;
+}
+.qc-input:focus,
+.qc-textarea:focus {
+	outline: none;
+	border-color: var(--accent);
+}
+.qc-textarea {
+	min-height: 80px;
+	resize: vertical;
+}
+.qc-required {
+	color: var(--error, #f44);
+	margin-left: 4px;
+}
 .qc-foot {
 	display: flex;
 	align-items: center;
@@ -2048,9 +2076,9 @@ body {
 	flex: 0 0 auto;
 }
 .thinking-card .thinking-body {
-	padding: var(--sp-3) var(--sp-6) var(--sp-5);
+	padding: var(--sp-2) var(--sp-4) var(--sp-3);
 	font-size: var(--fs-sm);
-	line-height: var(--lh-normal);
+	line-height: 1.4;
 	color: var(--fg-faint);
 	white-space: pre-wrap;
 	border-top: 1px solid var(--line-soft);

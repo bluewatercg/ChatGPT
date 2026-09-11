@@ -17,6 +17,8 @@ import { scanFilesCached, compileGlob, normalizeGlobPattern } from "./fileScan";
 import { BINARY_EXTS, isNoisePath, NOISE_GLOBS } from "./ignore";
 import { search as semanticIndexSearch, buildIndex, isIndexing, isIndexingEnabled } from "../semanticIndex";
 import { searchDocs, listDocSources } from "../docsIndex";
+import { GrepPage, type GrepMode } from "./grepResults";
+import type { ToolOutcome } from "../toolOutcome";
 
 // Minimal ripgrep --type -> file-extension map for the node fallback.
 const TYPE_EXTS: Record<string, string[]> = {
@@ -39,309 +41,263 @@ const TYPE_EXTS: Record<string, string[]> = {
   yaml: [".yaml", ".yml"],
 };
 
-/** Trim very long lines (minified bundles) so one line cannot flood the output. */
-function clip(line: string, max = 500): string {
-  return line.length > max ? line.slice(0, max) + " …[truncated]" : line;
-}
-
-/** Count newlines without allocating a split array. */
-function countLines(s: string): number {
-  let n = 0;
-  for (let i = s.indexOf("\n"); i !== -1; i = s.indexOf("\n", i + 1)) n++;
-  return n;
-}
-
 // ---- Grep (ripgrep with a node fallback) ----
 export const grepTool = defineTool("Grep", false, async (input, abortSignal) => {
   try {
-  if (abortSignal?.aborted) return { output: "(grep aborted)" };
-  const root = getWorkspaceRoot();
-  const mode: string = input.output_mode || "content";
-  let target = ".";
-  if (input.path) {
-    try {
-      target = safePath(input.path); // spawn arg — spaces OK without shell quoting
-    } catch (e) {
-      return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  }
-  const cap = Math.max(1, Math.min(Number(input.head_limit) || 200, 2000));
-  const skip = Math.max(0, Number(input.offset) || 0);
-  const pattern = String(input.pattern ?? "");
-  if (!pattern) return { output: "error: pattern is required" };
-
-  // Validate the regex up front so a bad pattern fails fast with a clear
-  // message instead of an opaque non-zero rg exit.
-  try {
-    new RegExp(pattern);
-  } catch (e) {
-    return { output: `error: invalid pattern: ${e instanceof Error ? e.message : String(e)}` };
-  }
-
-  const rgBin = await rgCommand();
-  if (rgBin) {
-    const args = [
-      "--color=never",
-      "--hidden",
-      "--no-messages",
-      // Emit forward slashes so output matches the node fallback and the paths
-      // the model passes back to Read/StrReplace.
-      "--path-separator", "/",
-      "--glob", "!**/.git/**",
-      "--glob", "!**/node_modules/**",
-      // Bound worst-case cost on generated/vendored blobs.
-      "--max-filesize", "8M",
-      "--max-columns", "500",
-      "--max-columns-preview",
-    ];
-    // Keep both backends in agreement about what counts as searchable code.
-    for (const g of NOISE_GLOBS) args.push("--glob", `!${g}`);
-    if (mode === "files_with_matches") {
-      args.push("--files-with-matches");
-    } else if (mode === "count") {
-      args.push("--count");
-    } else {
-      args.push("--line-number", "--no-heading", "--with-filename");
-      const ctxA = input["-A"] ?? input["-C"];
-      const ctxB = input["-B"] ?? input["-C"];
-      if (ctxA != null) args.push("-A", String(Math.max(0, Math.min(Number(ctxA) || 0, 50))));
-      if (ctxB != null) args.push("-B", String(Math.max(0, Math.min(Number(ctxB) || 0, 50))));
-    }
-    if (input["-i"]) args.push("-i");
-    if (input.multiline) args.push("-U", "--multiline-dotall");
-    if (input.glob) args.push("--glob", String(input.glob));
-    if (input.type) args.push("--type", String(input.type));
-    // Paginated calls must see a stable order; --sort=path costs parallelism,
-    // so only pay for it when the caller is actually paging through results.
-    if (skip > 0) args.push("--sort=path");
-    args.push("--regexp", pattern, "--", target);
-
-    const out = await new Promise<string>((res) => {
-      let settled = false;
-      let o = "";
-      let c: ReturnType<typeof spawn>;
-      const finish = (v: string) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        try { abortSignal?.removeEventListener("abort", onAbort); } catch { /* ignore */ }
-        res(v);
-      };
-      const onAbort = () => {
-        try { c.kill("SIGTERM"); } catch { /* ignore */ }
-        finish(o ? o.slice(0, 12_000) + "\n(grep aborted)" : "(grep aborted)");
-      };
-      // Hard kill hung rg even if AbortSignal is missing/ignored.
-      const timer = setTimeout(() => {
-        try { c.kill("SIGKILL"); } catch {
-          try { c.kill("SIGTERM"); } catch { /* ignore */ }
-        }
-        finish(o ? o.slice(0, 12_000) + "\n(grep timed out)" : "(grep timed out)");
-      }, 15_000);
-      try {
-        c = spawn(rgBin, args, { cwd: root, windowsHide: true });
-      } catch (e) {
-        finish(`(grep failed: ${e instanceof Error ? e.message : String(e)})`);
-        return;
-      }
-      if (abortSignal?.aborted) {
-        onAbort();
-        return;
-      }
-      abortSignal?.addEventListener("abort", onAbort, { once: true });
-      let flooded = false;
-      c.stdout?.on("data", (d) => {
-        o += d;
-        // Stop early once we clearly have more than the caller can consume,
-        // instead of buffering an entire repo-wide match set.
-        if (!flooded && (o.length > 4_000_000 || countLines(o) > skip + cap + 1_000)) {
-          flooded = true;
-          try { c.kill("SIGTERM"); } catch { /* ignore */ }
-        }
-      });
-      let stderr = "";
-      c.stderr?.on("data", (d) => { if (stderr.length < 2_000) stderr += d; });
-      c.on("error", (e) => finish(`(grep failed: ${e instanceof Error ? e.message : String(e)})`));
-      c.on("close", (code) => {
-        // rg prefixes results with "./" when searching the cwd; strip it so the
-        // model gets plain workspace-relative paths it can feed back to Read.
-        const all = o.split("\n").filter(Boolean).map((l) => (l.startsWith("./") ? l.slice(2) : l));
-        // rg exits 1 for "no matches" and >1 for real errors.
-        if (!all.length && code != null && code > 1 && stderr.trim()) {
-          finish(`error: ripgrep failed: ${stderr.trim().split("\n")[0]}`);
-          return;
-        }
-        const lines = skip ? all.slice(skip) : all;
-        const shown = lines.slice(0, cap);
-        if (!shown.length) return finish("(no matches)");
-        const rest = lines.length - shown.length;
-        const note = rest > 0 || flooded ? `\n… (at least ${lines.length + (flooded ? 1 : 0)} results${flooded ? "+" : ""}, truncated — refine the pattern, glob, or use head_limit/offset)` : "";
-        finish(shown.join("\n") + note);
-      });
-    });
-    return { output: out };
-  }
-
-  // Node fallback (no ripgrep available). Honor path/glob/type/-A/-B/-C/multiline.
-  let scopeRoot = root;
-  if (input.path) {
-    try {
-      scopeRoot = safePath(input.path);
-    } catch (e) {
-      return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  }
-  let lineRe: RegExp;
-  let multiRe: RegExp | null = null;
-  try {
-    const flags = input["-i"] ? "i" : "";
-    lineRe = new RegExp(pattern, flags);
-    multiRe = input.multiline ? new RegExp(pattern, flags + "s") : null;
-  } catch (e) {
-    return { output: `error: invalid pattern: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  const glob = input.glob ? compileGlob(normalizeGlobPattern(String(input.glob))) : null;
-  const typeExts = input.type ? TYPE_EXTS[String(input.type)] : null;
-  const aCtx = Math.max(0, Math.min(Number(input["-A"] ?? input["-C"] ?? 0), 50));
-  const bCtx = Math.max(0, Math.min(Number(input["-B"] ?? input["-C"] ?? 0), 50));
-
-  const { files: scanned, truncated: scanTruncated } = await scanFilesCached(scopeRoot, {
-    signal: abortSignal,
-    maxFiles: 40_000,
-    timeMs: 10_000,
-  });
-  if (abortSignal?.aborted) return { output: "(grep aborted)" };
-
-  // Cheap metadata filters first — avoids opening files we can never match.
-  const candidates = scanned.filter((f) => {
-    const rel = path.relative(root, f.abs).split(path.sep).join("/");
-    if (glob && !glob.test(rel)) return false;
-    if (typeExts && !typeExts.includes(path.extname(f.abs).toLowerCase())) return false;
-    if (BINARY_EXTS.has(path.extname(f.abs).toLowerCase())) return false;
-    if (isNoisePath(rel)) return false;
-    if (f.size > 4_000_000 || f.size === 0) return false;
-    return true;
-  });
-  // Deterministic order so head_limit/offset paginate consistently.
-  candidates.sort((a, b) => a.rel.localeCompare(b.rel));
-
-  const hitsByFile: Record<string, string[]> = {};
-  const countByFile: Record<string, number> = {};
-  const order: string[] = [];
-  let filesTruncated = candidates.length > 20_000;
-
-  // Read files concurrently; regex matching stays on the main thread but I/O
-  // no longer serializes, which was the dominant cost in the old fallback.
-  const CONCURRENCY = 16;
-  const list = candidates.slice(0, 20_000);
-  let cursor = 0;
-  let stopped = false;
-
-  const processFile = async (f: (typeof list)[number]): Promise<void> => {
-    const rel = path.relative(root, f.abs).split(path.sep).join("/");
-    let txt: string;
-    try {
-      const buf = await fs.readFile(f.abs);
-      // NUL byte in the head => binary; skip like ripgrep does.
-      const probe = buf.subarray(0, Math.min(buf.length, 8192));
-      if (probe.includes(0)) return;
-      txt = buf.toString("utf8");
-    } catch {
-      return; // unreadable
-    }
-    // Register the file as a match exactly once, regardless of output mode.
-    const mark = () => {
-      if (!hitsByFile[rel]) {
-        hitsByFile[rel] = [];
-        order.push(rel);
-        countByFile[rel] = 0;
-      }
-    };
-    const push = (line: string) => {
-      mark();
-      hitsByFile[rel].push(line);
-    };
-    if (multiRe) {
-      if (multiRe.test(txt)) {
-        mark();
-        countByFile[rel]++;
-        if (mode === "content") push(`${rel}:${clip(txt.replace(/\n/g, "\\n"))}`);
-      }
-      return;
-    }
-
-    // files_with_matches only needs to know whether ANY line matches.
-    if (mode === "files_with_matches") {
-      lineRe.lastIndex = 0;
-      if (lineRe.test(txt)) {
-        mark();
-        countByFile[rel]++;
-      }
-      return;
-    }
-
-    const lines = txt.split("\n");
-    for (let idx = 0; idx < lines.length; idx++) {
-      const l = lines[idx];
-      if (!lineRe.test(l)) continue;
-      mark();
-      countByFile[rel]++;
-      if (mode !== "content") continue; // count mode: tally only
-      for (let b = bCtx; b >= 1; b--) {
-        if (idx - b >= 0) push(`${rel}-${idx + 1 - b}-${clip(lines[idx - b])}`);
-      }
-      push(`${rel}:${idx + 1}:${clip(l)}`);
-      for (let a = 1; a <= aCtx; a++) {
-        if (idx + a < lines.length) push(`${rel}-${idx + 1 + a}-${clip(lines[idx + a])}`);
-      }
-    }
-  };
-
-  const totalHits = (): number => {
-    if (mode === "content") {
-      let n = 0;
-      for (const f of order) n += hitsByFile[f].length;
+    if (abortSignal?.aborted) return { output: "(grep aborted)", outcome: { status: "aborted" } };
+    const root = getWorkspaceRoot();
+    const mode: GrepMode = input.output_mode || "content";
+    if (!["content", "files_with_matches", "count"].includes(mode)) return { output: "error: invalid output_mode" };
+    const pageNumber = (value: unknown, fallback: number, name: string) => {
+      if (value == null) return fallback;
+      const n = Number(value);
+      if (!Number.isSafeInteger(n) || n < 0) throw new Error(`invalid ${name}`);
       return n;
+    };
+    const cap = Math.min(pageNumber(input.head_limit, 200, "head_limit") || 200, 2000);
+    const skip = pageNumber(input.offset, 0, "offset");
+    const aCtx = Math.min(pageNumber(input["-A"] ?? input["-C"], 0, "context"), 50);
+    const bCtx = Math.min(pageNumber(input["-B"] ?? input["-C"], 0, "context"), 50);
+    const pattern = String(input.pattern ?? "");
+    if (!pattern) return { output: "error: pattern is required" };
+    const target = input.path ? safePath(input.path) : root;
+    const relative = (file: string) => (path.isAbsolute(file) ? path.relative(root, file) : file.replace(/^\.\//, "")).split(path.sep).join("/");
+    const page = new GrepPage(mode, skip, cap);
+    const rgBin = await rgCommand();
+    if (rgBin) {
+      // JSON keeps filenames containing ':' unambiguous and separates source rows
+      // from file/group separators. Sorting applies to page zero too.
+      const args = ["--json", "--sort=path", "--color=never", "--hidden", "--no-messages", "--line-number", "--with-filename", "--path-separator", "/", "--max-filesize", "8M"];
+      for (const g of NOISE_GLOBS) args.push("--glob", `!${g}`);
+      args.push("--glob", "!**/.git/**", "--glob", "!**/node_modules/**");
+      if (mode === "content") args.push("-A", String(aCtx), "-B", String(bCtx));
+      if (mode === "files_with_matches") args.push("--max-count", "1");
+      if (input["-i"]) args.push("-i");
+      if (input.multiline) args.push("-U", "--multiline-dotall");
+      if (input.glob) args.push("--glob", String(input.glob));
+      if (input.type) args.push("--type", String(input.type));
+      args.push("--regexp", pattern, "--", target);
+      let outcome: ToolOutcome | undefined;
+      const output = await new Promise<string>((resolve) => {
+        let settled = false;
+        let child: ReturnType<typeof spawn> | undefined;
+        let pending = "";
+        let stderr = "";
+        let currentPath = "";
+        let lastRow = 0;
+        let lastMatch = 0;
+        let matchingLines = 0;
+        let markedFile = false;
+        const finish = (message?: string, status?: ToolOutcome["status"]) => {
+          if (settled) return;
+          settled = true;
+          if (status) outcome = { status };
+          clearTimeout(timer);
+          abortSignal?.removeEventListener("abort", onAbort);
+          resolve(page.format(message));
+        };
+        const stop = (message?: string, status?: ToolOutcome["status"]) => { try { child?.kill("SIGKILL"); } catch { /* already exited */ } finish(message, status); };
+        const onAbort = () => stop("grep aborted", "aborted");
+        const timer = setTimeout(() => stop("grep timed out", "timed_out"), 15_000);
+        const decode = (v: { text?: string; bytes?: string } | undefined) => v?.text ?? (v?.bytes ? Buffer.from(v.bytes, "base64").toString("utf8") : "");
+        const accept = (record: string) => {
+          if (!record || settled) return;
+          const event = JSON.parse(record);
+          const data = event.data;
+          if (event.type === "begin") {
+            currentPath = relative(decode(data.path)); lastRow = 0; lastMatch = 0; matchingLines = 0; markedFile = false;
+          } else if (event.type === "match" || event.type === "context") {
+            const file = relative(decode(data.path));
+            const matching = event.type === "match";
+            const lines = decode(data.lines).replace(/\r?\n$/, "").split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+              const number = Number(data.line_number) + i;
+              if (matching && number > lastMatch) { matchingLines++; lastMatch = number; }
+              if (mode === "files_with_matches" && matching && !markedFile) {
+                markedFile = true;
+                if (!page.push({ path: file })) { stop(); return; }
+              }
+              if (mode === "content" && number > lastRow) {
+                lastRow = number;
+                if (!page.push({ path: file, line: number, text: lines[i], match: matching })) { stop(); return; }
+              }
+            }
+          } else if (event.type === "end" && mode === "count" && matchingLines > 0) {
+            if (!page.push({ path: currentPath, count: matchingLines })) stop();
+          }
+        };
+        try { child = spawn(rgBin, args, { cwd: root, windowsHide: true }); }
+        catch (e) { finish(`grep failed: ${e instanceof Error ? e.message : String(e)}`, "failed"); return; }
+        child.on("error", (e) => finish(`error: ripgrep failed: ${e.message}`, "failed"));
+        if (abortSignal?.aborted) { onAbort(); return; }
+        abortSignal?.addEventListener("abort", onAbort, { once: true });
+        child.stdout?.setEncoding("utf8");
+        child.stdout?.on("data", (chunk: string) => {
+          if (settled) return;
+          pending += chunk;
+          // A record contains at most one <=8 MiB file, but allow JSON escaping.
+          if (pending.length > 64 * 1024 * 1024) { stop("grep JSON record exceeded its memory limit", "failed"); return; }
+          let newline: number;
+          try {
+            while (!settled && (newline = pending.indexOf("\n")) >= 0) {
+              const record = pending.slice(0, newline); pending = pending.slice(newline + 1); accept(record);
+            }
+          } catch { stop("error: malformed ripgrep output", "failed"); }
+        });
+        child.stderr?.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(0, 2000); });
+        child.on("close", (code) => {
+          if (settled) return;
+          try { if (pending.trim()) accept(pending); } catch { finish("error: malformed ripgrep output", "failed"); return; }
+          finish(code === null || code > 1 ? `error: ripgrep failed: ${stderr.trim().split("\n")[0] || `exit ${code}`}` : undefined, code === null || code > 1 ? "failed" : undefined);
+        });
+      });
+      return { output, ...(outcome ? { outcome } : {}) };
     }
-    return order.length;
-  };
 
-  const worker = async (): Promise<void> => {
-    while (cursor < list.length && !stopped) {
-      if (abortSignal?.aborted) {
-        stopped = true;
-        return;
-      }
-      const f = list[cursor++];
-      await processFile(f);
-      // Enough material to satisfy the request — stop scanning the rest.
-      if (order.length > 0 && totalHits() > skip + cap + 500) {
-        stopped = true;
-        filesTruncated = true;
+    // Files are read concurrently within a small batch, then consumed in sorted
+    // order. Completion order must never decide which files make the first page.
+    const flags = input["-i"] ? "i" : "";
+    let expression: RegExp;
+    try { expression = new RegExp(pattern, flags + (input.multiline ? "gs" : "")); }
+    catch (e) { return { output: `error: invalid pattern: ${e instanceof Error ? e.message : String(e)}` }; }
+    const glob = input.glob ? compileGlob(normalizeGlobPattern(String(input.glob))) : null;
+    const typeExts = input.type ? TYPE_EXTS[String(input.type)] : null;
+    if (input.type && !typeExts) return { output: `error: unsupported file type without ripgrep: ${String(input.type)}` };
+    const st = await fs.stat(target);
+    const scan = st.isFile() ? { files: [{ abs: target, rel: relative(target), size: st.size, mtimeMs: st.mtimeMs }], truncated: false }
+      : await scanFilesCached(target, { signal: abortSignal, maxFiles: 40_000, timeMs: 10_000 });
+    if (abortSignal?.aborted) return { output: "(grep aborted)", outcome: { status: "aborted" } };
+    const candidates = scan.files.filter((f) => {
+      const rel = relative(f.abs);
+      return (!glob || glob.test(rel)) && (!typeExts || typeExts.includes(path.extname(f.abs).toLowerCase()))
+        && !BINARY_EXTS.has(path.extname(f.abs).toLowerCase()) && !isNoisePath(rel) && f.size <= 8 * 1024 * 1024;
+    }).sort((a, b) => Buffer.compare(Buffer.from(relative(a.abs)), Buffer.from(relative(b.abs))));
+    const list = candidates.slice(0, 20_000);
+    const deadline = Date.now() + 15_000;
+    let incomplete = scan.truncated || candidates.length > list.length ? "file scan limit reached" : undefined;
+    let unreadable = 0;
+    outer: for (let at = 0; at < list.length; at += 4) {
+      if (abortSignal?.aborted) return { output: page.format("grep aborted"), outcome: { status: "aborted" } };
+      if (Date.now() > deadline) { incomplete = "grep timed out"; break; }
+      const batch = await Promise.all(list.slice(at, at + 4).map(async (file) => {
+        try {
+          const buf = await fs.readFile(file.abs, { signal: abortSignal });
+          if (buf.length > 8 * 1024 * 1024 || buf.subarray(0, 8192).includes(0)) return null;
+          return { file: relative(file.abs), text: buf.toString("utf8").replace(/^\uFEFF/, "") };
+        } catch { unreadable++; return null; }
+      }));
+      if (abortSignal?.aborted) return { output: page.format("grep aborted"), outcome: { status: "aborted" } };
+      for (const entry of batch) {
+        if (!entry) continue;
+        if (abortSignal?.aborted) return { output: page.format("grep aborted"), outcome: { status: "aborted" } };
+        const lines = entry.text ? entry.text.split(/\r?\n/) : [];
+        if (entry.text.endsWith("\n")) lines.pop();
+        const matches = new Set<number>();
+        if (input.multiline) {
+          expression.lastIndex = 0;
+          let match: RegExpExecArray | null;
+          let position = 0;
+          let line = 0;
+          while ((match = expression.exec(entry.text)) !== null) {
+            while (position < match.index) { if (entry.text.charCodeAt(position++) === 10) line++; }
+            let last = line;
+            for (let i = match.index; i < match.index + match[0].length; i++) {
+              if (entry.text.charCodeAt(i) === 10 && i + 1 < match.index + match[0].length) last++;
+            }
+            for (let i = line; i <= last && i < lines.length; i++) matches.add(i);
+            if (match[0].length === 0) expression.lastIndex++;
+          }
+        } else {
+          for (let i = 0; i < lines.length; i++) if (expression.test(lines[i])) matches.add(i);
+        }
+        if (!matches.size) continue;
+        if (mode !== "content") {
+          if (!page.push({ path: entry.file, count: matches.size })) break outer;
+          continue;
+        }
+        // Merge overlapping context windows before paging; each source line is
+        // emitted once and a matching line always keeps its ':' marker.
+        let previousEnd = -1;
+        for (const index of matches) {
+          const start = Math.max(previousEnd + 1, index - bCtx, 0);
+          const end = Math.min(lines.length - 1, index + aCtx);
+          for (let i = start; i <= end; i++) {
+            if (!page.push({ path: entry.file, line: i + 1, text: lines[i], match: matches.has(i) })) break outer;
+          }
+          previousEnd = Math.max(previousEnd, end);
+        }
       }
     }
-  };
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, list.length) }, worker));
-  if (abortSignal?.aborted) return { output: "(grep aborted)" };
-
-  order.sort((a, b) => a.localeCompare(b));
-  let result: string[];
-  if (mode === "files_with_matches") result = order;
-  else if (mode === "count") result = order.map((f) => `${f}:${countByFile[f]}`);
-  else result = order.flatMap((f) => hitsByFile[f]);
-  if (skip) result = result.slice(skip);
-  const truncated = result.length > cap || filesTruncated || scanTruncated;
-  const shown = result.slice(0, cap);
-  if (!shown.length) {
-    return { output: truncated ? "(no matches in the scanned subset — search was truncated)" : "(no matches)" };
-  }
-  const note = truncated
-    ? `\n… (at least ${result.length} results, truncated — refine the pattern, glob, or use head_limit/offset)`
-    : "";
-  return { output: shown.join("\n") + note };
+    if (unreadable && !incomplete) incomplete = `${unreadable} unreadable file(s)`;
+    return { output: page.format(incomplete), ...(incomplete === "grep timed out" ? { outcome: { status: "timed_out" as const } } : {}) };
   } catch (e) {
-    return { output: `error: Grep failed: ${e instanceof Error ? e.message : String(e)}` };
+    return { output: `error: Grep failed: ${e instanceof Error ? e.message : String(e)}`, outcome: { status: abortSignal?.aborted ? "aborted" : "failed" } };
   }
+});
+
+// ---- Rg (raw ripgrep, no shell) ----
+const RG_OUTPUT_CAP = 60_000;
+const RG_TIMEOUT_MS = 60_000;
+// Flags that would make ripgrep touch things outside the read-only contract.
+const RG_BLOCKED_FLAGS = new Set(["--pre", "--pre-glob", "-r", "--replace", "--passthru", "--files-from"]);
+
+export const rgTool = defineTool("Rg", false, async (input, abortSignal) => {
+  if (abortSignal?.aborted) return { output: "(rg aborted)", outcome: { status: "aborted" } };
+  const raw = Array.isArray(input?.args) ? input.args : [];
+  const args = raw.map((a: unknown) => String(a));
+  if (!args.length) return { output: "error: args is required (argv after 'rg')" };
+  if (args[0] === "rg" || /(^|[\\/])rg(\.exe)?$/i.test(args[0])) args.shift();
+  for (const a of args) {
+    const flag = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+    if (RG_BLOCKED_FLAGS.has(flag)) return { output: `error: ${flag} is not permitted; Rg is read-only. Use Shell for anything that executes programs or rewrites output.` };
+  }
+  const rgBin = await rgCommand();
+  if (!rgBin) return { output: "error: ripgrep is not available on this machine (not bundled with this VS Code build and not on PATH). Use Grep instead." };
+  let cwd: string;
+  try { cwd = input?.working_directory ? safePath(String(input.working_directory)) : getWorkspaceRoot(); }
+  catch (e) { return { output: `error: ${e instanceof Error ? e.message : String(e)}` }; }
+
+  const finalArgs = ["--color=never", "--no-messages", "--path-separator", "/", ...args];
+  return new Promise((resolve) => {
+    let settled = false;
+    let out = "";
+    let err = "";
+    let truncated = false;
+    let child: ReturnType<typeof spawn> | undefined;
+    const done = (status: ToolOutcome["status"], exitCode?: number, note?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      abortSignal?.removeEventListener("abort", onAbort);
+      const head = `[rg ${status}${exitCode != null ? ` exit_code=${exitCode}` : ""}${truncated ? " output=truncated" : ""}]`;
+      const body = out.trim() || (exitCode === 1 && status === "completed" ? "(no matches)" : "");
+      const trailer = [err.trim() && `stderr:\n${err.trim()}`, note].filter(Boolean).join("\n");
+      resolve({ output: [head, body, trailer].filter(Boolean).join("\n"), outcome: { status, exitCode } });
+    };
+    const kill = () => { try { child?.kill("SIGKILL"); } catch { /* exited */ } };
+    const onAbort = () => { kill(); done("aborted"); };
+    const timer = setTimeout(() => { kill(); done("timed_out", undefined, `rg exceeded ${RG_TIMEOUT_MS / 1000}s; narrow the search.`); }, RG_TIMEOUT_MS);
+    try { child = spawn(rgBin, finalArgs, { cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { done("failed", undefined, `spawn failed: ${e instanceof Error ? e.message : String(e)}`); return; }
+    if (abortSignal?.aborted) { onAbort(); return; }
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+    const collect = (sink: "out" | "err") => (chunk: Buffer) => {
+      if (settled) return;
+      const text = chunk.toString("utf8");
+      if (sink === "err") { if (err.length < 8_000) err += text; return; }
+      if (out.length >= RG_OUTPUT_CAP) { if (!truncated) { truncated = true; kill(); } return; }
+      out += text;
+      if (out.length > RG_OUTPUT_CAP) { out = out.slice(0, RG_OUTPUT_CAP); truncated = true; kill(); }
+    };
+    child.stdout?.on("data", collect("out"));
+    child.stderr?.on("data", collect("err"));
+    child.on("error", (e) => done("failed", undefined, `ripgrep failed: ${e.message}`));
+    child.on("close", (code) => {
+      // ripgrep: 0 matches, 1 no matches, 2 error. A kill from truncation still counts as completed.
+      if (truncated) done("completed", code ?? 0, `output capped at ${RG_OUTPUT_CAP} chars; narrow the query (e.g. add a path, -l, or --max-count).`);
+      else done(code === 2 ? "failed" : "completed", code ?? undefined);
+    });
+  });
 });
 
 // ---- SemanticSearch ----
@@ -432,18 +388,23 @@ export const searchDocsTool = defineTool("SearchDocs", false, async (input) => {
   }
 
   const all: { doc: string; url: string; title: string; text: string; score: number }[] = [];
+  const failures: string[] = [];
   for (const d of targets) {
-    const hits = await searchDocs(d.id, query, k).catch(() => []);
-    for (const h of hits) all.push({ doc: d.name, ...h });
+    try {
+      const hits = await searchDocs(d.id, query, k);
+      for (const h of hits) all.push({ doc: d.name, ...h });
+    } catch (error) {
+      failures.push(`${d.name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   all.sort((a, b) => b.score - a.score);
   const top = all.slice(0, k);
-  if (!top.length) return { output: "(no matching excerpts)" };
+  if (!top.length) return { output: failures.length ? `error: ${failures.join("; ")}` : "(no matching excerpts)" };
   const snip = (t: string) => (t.length > 1200 ? t.slice(0, 1200) + "\n... (trimmed)" : t);
   return {
     output: top
       .map((h) => `[${h.doc}] ${h.title} - ${h.url} (${h.score.toFixed(2)})\n${snip(h.text)}`)
-      .join("\n\n---\n\n"),
+      .join("\n\n---\n\n") + (failures.length ? `\n\nUnavailable sources: ${failures.join("; ")}` : ""),
   };
   } catch (e) {
     return { output: `error: SearchDocs failed: ${e instanceof Error ? e.message : String(e)}` };

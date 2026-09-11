@@ -13,6 +13,7 @@ import type { AskQuestionItem } from "./tools";
 import type { AgentEvent, Attachment, Mode, Step } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
 import type { TeamDef } from "./teams";
+import type { ContextState } from "./contextState";
 
 /** Every input needed to drive a single {@link runAgent} run. */
 export interface RunAgentOptions {
@@ -23,8 +24,15 @@ export interface RunAgentOptions {
 	prompt: string;
 	attachments?: Attachment[];
 	history: Step[];
+	/** Mutable working-memory checkpoint; persist beside the full transcript. */
+	contextState?: ContextState;
+	changeOwner?: import("../stores/pendingChanges").ChangeOwner;
+	/** Stable conversation key for transports that support prompt cache routing. */
+	promptCacheKey?: string;
+	/** Conversation owner for retained terminal evidence, shared by parent and children. */
+	shellOwnerKey?: string;
 	maxTokens?: number;
-	/** Max loop steps before pausing (0/undefined = default 50). */
+	/** Max loop steps before pausing (0/undefined = default 200). */
 	maxSteps?: number;
 	/** Keep going past the step limit instead of pausing. */
 	autoContinue?: boolean;
@@ -44,6 +52,8 @@ export interface RunAgentOptions {
 	enableWebFetch?: boolean;
 	approve?: (toolName: string, input: any, callId?: string) => Promise<boolean | { approved: false; blockedSubject: string }>;
 	isSubagent?: boolean;
+	/** Read-only parent brief and original user requests for a delegated run. */
+	inheritedContext?: { instructions: string; userRequests: string; summary?: string };
 	customSubagents?: SubagentDef[];
 	/** All configured subagent teams. */
 	teams?: TeamDef[];
@@ -53,19 +63,21 @@ export interface RunAgentOptions {
 	subagentModel?: string;
 	/** Model ids selectable for this run's provider; a Task model outside this list is ignored. */
 	availableModels?: string[];
+	/** Resolve options for a different child/summary model; never inherit incompatible reasoning controls. */
+	resolveModelOptions?: (model: string) => Pick<RunAgentOptions, "contextTokens" | "maxTokens" | "modelParams" | "sampling">;
 	/** Called when a subagent starts, so the UI can offer a per-subagent stop. */
 	registerSubagentAbort?: (callId: string, abort: () => void) => void;
 	/** Ask the user clarifying questions via the chat UI (ask_question tool). */
 	askUser?: (callId: string, header: string | undefined, questions: AskQuestionItem[], signal?: AbortSignal) => Promise<Record<string, string[]>>;
 	onAfterRun?: () => void;
 	/** Blocking before-shell hook: resolves with a block reason to veto the command. */
-	onBeforeShell?: (command: string) => Promise<string | undefined> | void;
+	onBeforeShell?: (command: string, signal?: AbortSignal) => Promise<string | undefined> | void;
 	onAfterEdit?: (path: string) => void;
 	/**
 	 * Generic hook trigger for the remaining events (beforeMcp, beforeReadFile, subagentStop, preCompact).
 	 * For blocking "before" events the resolved string (if any) vetoes the action.
 	 */
-	onHook?: (event: "beforeMcp" | "beforeReadFile" | "subagentStop" | "preCompact", context: Record<string, string>, tool?: string) => Promise<string | undefined> | void;
+	onHook?: (event: "beforeMcp" | "beforeReadFile" | "beforeEdit" | "subagentStop" | "preCompact", context: Record<string, string>, tool?: string, signal?: AbortSignal) => Promise<string | undefined> | void;
 	signal: AbortSignal;
 	emit: (e: AgentEvent) => void;
 }

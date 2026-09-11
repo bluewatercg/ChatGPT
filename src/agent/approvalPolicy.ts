@@ -19,6 +19,8 @@
  */
 
 import * as nodePath from "path";
+import { realpathSync } from "fs";
+import { planRelativePath } from "../shared/planPath";
 import { normalizePathInput, toWorkspacePath } from "../context/workspaceUtils";
 
 export type ApprovalMode = "allow" | "ask" | "review" | "deny";
@@ -51,9 +53,9 @@ export const DEFAULT_APPROVAL: ApprovalPolicy = {
 export function actionTypeFor(toolName: string): ApprovalActionType | undefined {
 	if (toolName === "Shell") return "shell";
 	if (toolName === "Delete") return "delete";
-	if (toolName === "StrReplace" || toolName === "Write" || toolName === "EditNotebook") return "edits";
+	if (toolName === "StrReplace" || toolName === "Write" || toolName === "EditNotebook" || toolName === "WritePlan") return "edits";
 	if (toolName === "WebSearch" || toolName === "WebFetch") return "web";
-	if (toolName.startsWith("mcp__")) return "mcp";
+	if (toolName === "CallMcpTool" || toolName === "FetchMcpResource" || toolName.startsWith("mcp__")) return "mcp";
 	return undefined;
 }
 
@@ -69,19 +71,38 @@ const PATH_INPUTS: Record<string, string[]> = {
 	Delete: ["path"],
 	EditNotebook: ["target_notebook"],
 	Shell: ["working_directory"],
+	FetchMcpResource: ["downloadPath"],
+	ReadLints: ["paths"],
 };
+
+/** Resolve existing parents too, so a new file under a symlink is checked correctly. */
+export function canonicalPath(input: string): string {
+	let current = nodePath.resolve(input);
+	const suffix: string[] = [];
+	for (;;) {
+		try { return nodePath.join(realpathSync(current), ...suffix.reverse()); }
+		catch (error: any) {
+			if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+			const parent = nodePath.dirname(current);
+			if (parent === current) return nodePath.resolve(input);
+			suffix.push(nodePath.basename(current));
+			current = parent;
+		}
+	}
+}
 
 /** True when a file path lands outside the workspace root. */
 export function isOutsideWorkspace(path: string, root: string | undefined): boolean {
 	if (!root || !path) return false;
 	const candidate = normalizePathInput(path);
-	const resolvedRoot = nodePath.resolve(root);
-	const resolvedPath = nodePath.resolve(resolvedRoot, candidate);
+	const resolvedRoot = canonicalPath(root);
+	const resolvedPath = canonicalPath(nodePath.resolve(root, candidate));
 	const relative = nodePath.relative(resolvedRoot, resolvedPath);
 	return relative === ".." || relative.startsWith(`..${nodePath.sep}`) || nodePath.isAbsolute(relative);
 }
 
 function pathsForCall(toolName: string, input: any, root?: string): string[] {
+	if (toolName === "WritePlan") return [nodePath.join(root ?? ".", planRelativePath(input?.title))];
 	return (PATH_INPUTS[toolName] ?? []).flatMap((key) => {
 		const value = input?.[key];
 		const paths = Array.isArray(value) ? value.map(String) : value == null ? [] : [String(value)];
@@ -89,13 +110,19 @@ function pathsForCall(toolName: string, input: any, root?: string): string[] {
 	});
 }
 
-/**
- * Action type for a concrete call: file tools targeting paths outside the
- * workspace escalate to "outside" (covers Read, which is otherwise ungated).
- */
-export function actionTypeForCall(toolName: string, input: any, root: string | undefined): ApprovalActionType | undefined {
-	if (pathsForCall(toolName, input, root).some((path) => isOutsideWorkspace(path, root))) return "outside";
-	return actionTypeFor(toolName);
+/** Every applicable action and location policy must allow a call. */
+export function actionTypesForCall(toolName: string, input: any, root?: string): ApprovalActionType[] {
+	const action = actionTypeFor(toolName);
+	const types: ApprovalActionType[] = action ? [action] : [];
+	if (toolName === "FetchMcpResource" && input?.downloadPath) types.push("edits");
+	if (pathsForCall(toolName, input, root).some((path) => isOutsideWorkspace(path, root))) types.push("outside");
+	return types;
+}
+
+/** Primary UI label. Evaluation always checks all applicable policies. */
+export function actionTypeForCall(toolName: string, input: any, root?: string): ApprovalActionType | undefined {
+	const types = actionTypesForCall(toolName, input, root);
+	return types.includes("outside") ? "outside" : types[0];
 }
 
 /** The string a rule's patterns match against, per action type. */
@@ -103,7 +130,7 @@ export function subjectFor(type: ApprovalActionType, toolName: string, input: an
 	switch (type) {
 		case "shell": return String(input?.command ?? "");
 		case "edits":
-		case "delete": return String(input?.path ?? input?.target_notebook ?? "");
+		case "delete": return toolName === "WritePlan" ? planRelativePath(input?.title) : String(input?.path ?? input?.target_notebook ?? input?.downloadPath ?? "");
 		case "outside": return pathsForCall(toolName, input).join(", ");
 		case "web": return String(input?.url ?? input?.search_term ?? input?.query ?? "");
 		case "mcp": return toolName;
@@ -129,6 +156,11 @@ export function splitShellCommands(command: string): string[] {
 	for (let i = 0; i < command.length; i++) {
 		const c = command[i];
 		const next = command[i + 1];
+		if (c === "\\" && quote !== "'" && next) {
+			buf += c + next;
+			i++;
+			continue;
+		}
 		if (quote) {
 			buf += c;
 			if (c === quote && command[i - 1] !== "\\") quote = null;
@@ -164,6 +196,10 @@ export function splitShellCommands(command: string): string[] {
 				push();
 				continue;
 			}
+			if (c === "&" && command[i - 1] !== ">" && next !== ">") {
+				push();
+				continue;
+			}
 		}
 		buf += c;
 	}
@@ -173,6 +209,43 @@ export function splitShellCommands(command: string): string[] {
 		const m = /^[$@&]?\s*[({]\s*([\s\S]*?)\s*[)}]\s*$/.exec(part);
 		return m && m[1].trim() ? splitShellCommands(m[1]) : [part];
 	});
+}
+
+/** Inspect visible substitutions without executing source or claiming a shell sandbox. */
+function shellSubstitutions(command: string, depth = 0): { commands: string[]; dynamic: boolean } {
+	if (depth > 16) return { commands: [], dynamic: true };
+	const commands: string[] = [];
+	let dynamic = splitShellCommands(command).some((part) => /^(?:(?:eval|exec|source|\.|(?:ba|z|k|c)?sh|pwsh|powershell|cmd|if|for|while|until|case|select)\s|(?:function\s+)?[\w-]+\s*\(\)\s*\{)/i.test(part));
+	let quote: "'" | '"' | undefined;
+	for (let i = 0; i < command.length; i++) {
+		const c = command[i];
+		if (quote === "'") { if (c === "'") quote = undefined; continue; }
+		if (c === "\\") { i++; continue; }
+		if (c === "'" && !quote) { quote = "'"; continue; }
+		if (c === '"') { quote = quote === '"' ? undefined : '"'; continue; }
+		const parenthesized = (c === "$" || c === "<" || c === ">") && command[i + 1] === "(";
+		if (c === "$" || parenthesized || c === "`") dynamic = true;
+		if (!parenthesized && c !== "`") continue;
+		const start = i + (parenthesized ? 2 : 1);
+		let balance = 1;
+		let innerQuote: "'" | '"' | undefined;
+		let end = start;
+		for (; end < command.length; end++) {
+			const ch = command[end];
+			if (ch === "\\" && innerQuote !== "'") { end++; continue; }
+			if (innerQuote) { if (ch === innerQuote) innerQuote = undefined; continue; }
+			if (ch === "'" || ch === '"') { innerQuote = ch; continue; }
+			if (!parenthesized && ch === "`") break;
+			if (parenthesized && ch === "(") balance++;
+			if (parenthesized && ch === ")" && --balance === 0) break;
+		}
+		const body = command.slice(start, end);
+		commands.push(...splitShellCommands(body));
+		const nested = shellSubstitutions(body, depth + 1);
+		commands.push(...nested.commands);
+		i = end;
+	}
+	return { commands, dynamic };
 }
 
 /**
@@ -225,8 +298,14 @@ export type ApprovalDecision = "allow" | "ask" | "deny";
 
 /** Decide one subject against a rule. */
 function decideSubject(r: ApprovalRule, type: ApprovalActionType, subject: string, prefixOk: boolean): ApprovalDecision {
-	if ((r.denylist ?? []).some((p) => matchPattern(p, subject, prefixOk))) return "deny";
-	if ((r.allowlist ?? []).some((p) => matchPattern(p, subject, prefixOk))) return "allow";
+	const matches = (pattern: string) => {
+		if (type !== "shell" || pattern.includes("*")) return matchPattern(pattern, subject, prefixOk);
+		const prefix = pattern.trim().toLowerCase();
+		const value = subject.trim().toLowerCase();
+		return !!prefix && (value === prefix || value.startsWith(prefix + " ") || value.startsWith(prefix + "\t"));
+	};
+	if ((r.denylist ?? []).some(matches)) return "deny";
+	if ((r.allowlist ?? []).some(matches)) return "allow";
 
 	const mode: ApprovalMode = r.mode ?? "ask";
 	if (mode === "allow") return "allow";
@@ -243,7 +322,7 @@ export function subjectsFor(type: ApprovalActionType, toolName: string, input: a
 	const subject = subjectFor(type, toolName, input);
 	if (type !== "shell") return [subject];
 	const parts = splitShellCommands(subject);
-	return parts.length ? parts : [subject];
+	return [...(parts.length ? parts : [subject]), ...shellSubstitutions(subject).commands];
 }
 
 /**
@@ -251,25 +330,33 @@ export function subjectsFor(type: ApprovalActionType, toolName: string, input: a
  * The strictest decision across all of the call's subjects wins.
  */
 export function evaluateApproval(policy: ApprovalPolicy, toolName: string, input: any, workspaceRoot?: string): ApprovalDecision {
-	const type = actionTypeForCall(toolName, input, workspaceRoot);
-	if (!type) return "allow";
-	const r = policy[type] ?? DEFAULT_APPROVAL[type];
-	const prefixOk = type === "shell" || type === "mcp" || type === "web";
-
 	let decision: ApprovalDecision = "allow";
-	for (const subject of subjectsFor(type, toolName, input)) {
-		const d = decideSubject(r, type, subject, prefixOk);
-		if (d === "deny") return "deny";
-		if (d === "ask") decision = "ask";
+	for (const type of actionTypesForCall(toolName, input, workspaceRoot)) {
+		const r = policy[type] ?? DEFAULT_APPROVAL[type];
+		const prefixOk = type === "shell" || type === "mcp" || type === "web";
+		for (const subject of subjectsFor(type, toolName, input)) {
+			const d = decideSubject(r, type, subject, prefixOk);
+			if (d === "deny") return "deny";
+			if (d === "ask") decision = "ask";
+		}
+		// Literal prefix rules cannot reliably authorize expanded shell programs.
+		// An unrestricted allow policy remains unrestricted; patterned/review
+		// policies require confirmation when expansion prevents static evaluation.
+		if (type === "shell" && shellSubstitutions(String(input?.command ?? "")).dynamic && (r.mode !== "allow" || r.denylist?.length)) {
+			if (r.mode === "deny") return "deny";
+			decision = "ask";
+		}
 	}
 	return decision;
 }
 
-/** The chained command that triggered a deny (for the message shown to the model). */
+/** The subject that triggered any denial. */
 export function deniedSubject(policy: ApprovalPolicy, toolName: string, input: any, workspaceRoot?: string): string | undefined {
-	const type = actionTypeForCall(toolName, input, workspaceRoot);
-	if (!type) return undefined;
-	const r = policy[type] ?? DEFAULT_APPROVAL[type];
-	const prefixOk = type === "shell" || type === "mcp" || type === "web";
-	return subjectsFor(type, toolName, input).find((s) => decideSubject(r, type, s, prefixOk) === "deny");
+	for (const type of actionTypesForCall(toolName, input, workspaceRoot)) {
+		const r = policy[type] ?? DEFAULT_APPROVAL[type];
+		const prefixOk = type === "shell" || type === "mcp" || type === "web";
+		const subject = subjectsFor(type, toolName, input).find((s) => decideSubject(r, type, s, prefixOk) === "deny");
+		if (subject !== undefined) return subject;
+	}
+	return undefined;
 }

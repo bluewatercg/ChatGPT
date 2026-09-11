@@ -7,6 +7,8 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
+import { sendMessageIntent, restoreTurns } from "../../src/shared/chatSession";
+import { setQuestionAnswers } from "../../src/shared/turns";
 import * as React from "react";
 import { Icon } from "../shared/icons";
 import { renderMarkdown } from "../shared/markdown";
@@ -1000,15 +1002,16 @@ export function App() {
   };
 
   // Seed a session's turns from persisted data without clobbering a live run.
-  const seedSession = (id: string | undefined, persisted: Turn[], usedTokens?: number) => {
+  const seedSession = (id: string | undefined, persisted: Turn[], usedTokens?: number, running = false) => {
     if (!id) return;
     // Stale "running" tools left on disk after IDE close → settle them.
-    const clean = forceSettleOpenWork(closeTrailingThinking(persisted), "cancelled");
+    const clean = restoreTurns(persisted, running);
     const s = sessionsRef.current.get(id);
     if (!s) {
-      sessionsRef.current.set(id, { turns: clean, running: false, status: { text: "" }, usedTokens });
-    } else if (!s.running) {
-      // Only refresh from disk when not running (live turns are authoritative).
+      sessionsRef.current.set(id, { turns: clean, running, status: { text: running ? "Working" : "" }, usedTokens });
+    } else {
+      // The host owns live snapshots as well as persisted history.
+      s.running = running;
       s.turns = clean;
       if (usedTokens !== undefined) s.usedTokens = usedTokens;
     }
@@ -1030,7 +1033,7 @@ export function App() {
         case "initialState":
           setMode(msg.mode);
           setSelectedModel(msg.selectedModel || "");
-          seedSession(msg.activeId, msg.turns || [], msg.usedTokens);
+          seedSession(msg.activeId, msg.turns || [], msg.usedTokens, msg.runningConvIds?.includes(msg.activeId ?? "") ?? false);
           markRunning(msg.runningConvIds);
           setActiveId(msg.activeId);
           setPersonas(msg.personas || []);
@@ -1073,7 +1076,7 @@ export function App() {
           break;
         case "loadConversation":
           if (!msg.activeId) sessionsRef.current.set("", { turns: [], running: false, status: { text: "" } });
-          else seedSession(msg.activeId, msg.turns || [], msg.usedTokens);
+          else seedSession(msg.activeId, msg.turns || [], msg.usedTokens, msg.running === true);
           setActiveId(msg.activeId);
           setHistoryOpen(false);
           if (msg.personaId) setPersonaId(msg.personaId);
@@ -1090,28 +1093,39 @@ export function App() {
           break;
         case "runStarted": {
           // First message in a brand-new chat: migrate the pending (id-less) session.
-          if (!activeIdRef.current) {
+          if (msg.created) {
             const pending = sessionsRef.current.get("") ;
             if (pending) { sessionsRef.current.set(msg.convId, pending); sessionsRef.current.delete(""); }
+            const queued = queueRef.current.get("");
+            if (queued) { queueRef.current.set(msg.convId, queued); queueRef.current.delete(""); }
             const d = draftsRef.current.get("");
             if (d) { draftsRef.current.set(msg.convId, d); draftsRef.current.delete(""); }
-            activeIdRef.current = msg.convId;
-            setActiveId(msg.convId);
+            if (!activeIdRef.current) {
+              activeIdRef.current = msg.convId;
+              setActiveId(msg.convId);
+            }
             setOpenTabs((t) => {
               const next = t.filter((id) => id !== "");
               return next.includes(msg.convId) ? next : [...next, msg.convId];
             });
           }
           const s = sessionFor(msg.convId);
+          if (msg.turns) s.turns = msg.turns;
           s.running = true;
           s.status = { text: "Generating…" };
           force();
           break;
         }
         case "error": {
-          const s = sessionFor(activeIdRef.current);
+          const s = sessionFor(msg.convId ?? activeIdRef.current);
           s.running = false;
           s.status = { text: "Error: " + msg.message, error: true };
+          force();
+          break;
+        }
+        case "questionAnswered": {
+          const s = sessionFor(msg.convId);
+          s.turns = setQuestionAnswers(s.turns, msg.callId, msg.answers);
           force();
           break;
         }
@@ -1158,7 +1172,7 @@ export function App() {
             else if (ev.type === "tool-call-args") {/* keep current tool label while args stream */}
             else if (ev.type === "tool-call-completed") s.status = { text: "Planning next moves" };
             else if (ev.type === "retry") s.status = { text: `Retrying (${ev.attempt}/${ev.max})…` };
-            else if (ev.type === "usage") s.usedTokens = ev.totalTokens;
+            else if (ev.type === "usage" && (!ev.source || ev.source === "parent")) s.usedTokens = ev.totalTokens;
             else if (ev.type === "compaction") s.status = { text: ev.status === "running" ? "Summarizing conversation" : "Planning next moves" };
             else if (ev.type === "shell-notify") s.status = { text: ev.message };
             else if (ev.type === "error") {
@@ -1207,12 +1221,13 @@ export function App() {
     };
   }, []);
 
-  const sendNow = React.useCallback((text: string, attachments?: Attachment[], model?: string, mode2?: Mode) => {
-    const s = sessionFor(activeIdRef.current);
+  const sendNow = React.useCallback((convId: string | undefined, text: string, attachments?: Attachment[], model?: string, mode2?: Mode) => {
+    const s = sessionFor(convId);
     s.turns = [...s.turns, { role: "user", text, attachments, model, mode: mode2 }];
     pinTopRef.current = true;
     force();
-    post({ type: "sendMessage", text, attachments });
+    s.running = true;
+    post(sendMessageIntent(convId, text, attachments, model, mode2));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1223,7 +1238,7 @@ export function App() {
     const [next, ...rest] = q;
     if (rest.length) queueRef.current.set(convId, rest);
     else queueRef.current.delete(convId);
-    sendNow(next.text, next.attachments, next.model, next.mode);
+    sendNow(convId || undefined, next.text, next.attachments, next.model, next.mode);
     return true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1242,7 +1257,7 @@ export function App() {
       if (!s.running) window.setTimeout(() => flushQueueRef.current(id), 0);
       return;
     }
-    sendNow(text, attachments.length ? attachments : undefined, selectedModel, mode);
+    sendNow(activeIdRef.current, text, attachments.length ? attachments : undefined, selectedModel, mode);
   };
 
   // Queue item actions.
@@ -1273,7 +1288,7 @@ export function App() {
     if (q.length) queueRef.current.set(id, q);
     else queueRef.current.delete(id);
     if (sessionFor(id).running) suppressFlushRef.current.add(id);
-    sendNow(item.text, item.attachments, item.model, item.mode);
+    sendNow(id || undefined, item.text, item.attachments, item.model, item.mode);
   };
 
   // Clicking outside the inline edit composer cancels the edit.
@@ -1329,7 +1344,7 @@ export function App() {
     setRevertPrompt(null);
     pinTopRef.current = true;
     force();
-    post({ type: "sendMessage", text, attachments: attachments.length ? attachments : undefined, fromIndex: index, model: selectedModel, mode, revertFiles });
+    post({ type: "sendMessage", convId: activeIdRef.current ?? null, text, attachments: attachments.length ? attachments : undefined, fromIndex: index, model: selectedModel, mode, revertFiles });
   };
 
   // Switch to agent mode and kick off implementation of a written plan.
@@ -1344,7 +1359,7 @@ export function App() {
     s.turns = [...s.turns, { role: "user", text }];
     pinTopRef.current = true;
     force();
-    post({ type: "sendMessage", text });
+    post(sendMessageIntent(activeIdRef.current, text, undefined, undefined, "agent"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

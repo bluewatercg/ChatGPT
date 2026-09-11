@@ -8,279 +8,257 @@
  */
 
 import { safePath, getWorkspaceRoot } from "../../context/workspaceUtils";
-import { defineTool } from "./types";
+import { defineTool, type ToolContext, type ToolResult } from "./types";
+import type { ToolOutcome } from "../toolOutcome";
 import {
-  bgShells,
-  nextShellId,
-  waitForShell,
-  renderShell,
-  pushShellOutput,
-  getShellSession,
-  spawnShellCommand,
-  killShellProcess,
-  applyCwdSideEffect,
-  type BgShell,
-  type ShellNotify,
+  nextShellId, registerShellJob, getOwnedShell, shellOutcome,
+  finishShellTranscript, waitForShell, renderShell, pushShellOutput,
+  getShellSession, spawnShellCommand, killShellProcess, applyCwdSideEffect,
+  type BgShell, type ShellNotify,
 } from "./shared";
-/** Default foreground wait for simple commands; hard max keeps the loop responsive. */
-const DEFAULT_BLOCK_MS = 30_000;
 
+const DEFAULT_BLOCK_MS = 30_000;
 const MAX_BLOCK_MS = 30_000;
-const MAX_AWAIT_MS = 45_000;
-/** Absolute hard wall even if block_until_ms is large / tool timeout is higher. */
-const SHELL_HARD_WALL_MS = 45_000;
+export const MAX_AWAIT_MS = 120_000;
+const BACKGROUND_LIFETIME_MS = 600_000;
+
+function failure(message: string): ToolResult {
+  return { output: `error: ${message}`, outcome: { status: "failed" } };
+}
+
+function recordOutcome(ctx: ToolContext | undefined, callId: string | undefined, outcome: ToolOutcome): void {
+  if (!callId) return;
+  try { ctx?.recordToolOutcome?.(callId, outcome); } catch { /* bookkeeping must not interrupt the process */ }
+}
+
+function cancellation(signal?: AbortSignal): "aborted" | "timed_out" {
+  const reason = signal?.reason;
+  return reason?.name === "TimeoutError" || /^timeout:/i.test(String(reason?.message ?? "")) ? "timed_out" : "aborted";
+}
 
 /** Build a notify_on_output config from the tool input, if present. */
-function buildNotify(input: any, ctx: any): ShellNotify | undefined {
+function buildNotify(input: any, ctx?: ToolContext): ShellNotify | undefined {
   const cfg = input?.notify_on_output;
-  if (!cfg || !cfg.pattern) return undefined;
+  if (!cfg?.pattern) return undefined;
   let re: RegExp;
-  try {
-    re = new RegExp(String(cfg.pattern));
-  } catch {
-    return undefined;
-  }
+  try { re = new RegExp(String(cfg.pattern)); } catch { return undefined; }
   return {
-    re,
-    reason: String(cfg.reason ?? "output"),
+    re, reason: String(cfg.reason ?? "output"),
     debounceMs: Math.max(5000, Number(cfg.debounce_ms) || 0),
-    lastNotified: 0,
-    emit: ctx?.emitShellNotify,
+    lastNotified: 0, emit: ctx?.emitShellNotify,
   };
 }
 
-/**
- * Stream the rendered card to the UI while the command runs, throttled so a
- * chatty build can't flood the webview.
- */
-function makeLiveStream(sh: BgShell, callId: string | undefined, ctx: any): (() => void) | undefined {
+/** A live UI subscription lasts for this invocation, not the retained job. */
+function makeLiveStream(sh: BgShell, callId: string | undefined, ctx?: ToolContext) {
   const emit = ctx?.emitToolProgress;
-  if (!emit || !callId) return undefined;
   let last = 0;
   let timer: NodeJS.Timeout | undefined;
+  let disposed = false;
   const send = () => {
-    last = Date.now();
     timer = undefined;
-    try { emit(callId, renderShell(sh)); } catch { /* ignore */ }
+    if (disposed || !emit || !callId) return;
+    last = Date.now();
+    try { emit(callId, renderShell(sh)); } catch { /* UI failure must not kill the job */ }
   };
-  return () => {
-    if (timer) return;
-    const wait = Math.max(0, 120 - (Date.now() - last));
-    timer = setTimeout(send, wait);
-    timer.unref?.();
+  return {
+    update() {
+      if (disposed || timer || !emit || !callId) return;
+      timer = setTimeout(send, Math.max(0, 120 - (Date.now() - last)));
+      timer.unref?.();
+    },
+    dispose() {
+      if (timer) clearTimeout(timer);
+      send();
+      disposed = true;
+    },
   };
 }
 
-// ---- Shell (stateful session; backgrounds a command past block_until_ms) ----
-export const runTerminalTool = defineTool("Shell", true, async (input, abortSignal, callId, ctx) => {
-  const root = getWorkspaceRoot();
-  const requestedBlock = Number(input.block_until_ms);
-  const rawBlock = Number.isFinite(requestedBlock) ? requestedBlock : DEFAULT_BLOCK_MS;
-  const blockMs = rawBlock <= 0 ? 0 : Math.min(Math.max(0, rawBlock), MAX_BLOCK_MS);
-  const command = String(input.command ?? "").trim();
-  if (!command) return { output: "error: command is required" };
-
-  // Prune finished shells older than 10 minutes to bound the registry.
-  for (const [k, v] of bgShells) {
-    if (v.done && Date.now() - v.startedAt > 600_000) bgShells.delete(k);
-  }
-
-  const sessionKey = (ctx as any)?.shellSessionKey ?? "default";
-  const session = getShellSession(sessionKey, root);
-
-  // Serialize foreground commands per run so their output can't interleave.
-  // Always settle the queue slot even if this command errors/times out.
-  let releaseQueue!: () => void;
-  const prev = session.queue.catch(() => {});
-  session.queue = new Promise<void>((r) => {
-    releaseQueue = r;
+/** Wait for a queue slot without releasing later commands past an earlier one. */
+async function waitForQueue(previous: Promise<unknown>, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  await new Promise<void>(resolve => {
+    const finish = () => { signal?.removeEventListener("abort", finish); resolve(); };
+    signal?.addEventListener("abort", finish, { once: true });
+    void previous.then(finish, finish);
   });
-  await Promise.race([
-    prev,
-    new Promise<void>((resolve) => {
-      setTimeout(resolve, MAX_BLOCK_MS + 5_000).unref?.();
-    }),
-  ]);
+}
 
+export const runTerminalTool = defineTool("Shell", true, async (input, abortSignal, callId, ctx) => {
+  const command = String(input?.command ?? "").trim();
+  if (!command) return failure("command is required");
+  const requested = Number(input?.block_until_ms);
+  const blockMs = Math.min(MAX_BLOCK_MS, Math.max(0, Number.isFinite(requested) ? requested : DEFAULT_BLOCK_MS));
+  const root = getWorkspaceRoot();
+  const sessionKey = ctx?.shellSessionKey ?? "default";
+  // Production runs supply a stable conversation owner. A caller without one
+  // may execute a command but cannot read another invocation's transcript.
+  const ownerKey = ctx?.shellOwnerKey ?? ctx?.shellSessionKey;
+  const session = getShellSession(sessionKey, root);
+  let releaseQueue!: () => void;
+  const previous = session.queue.catch(() => {});
+  const slot = new Promise<void>(resolve => { releaseQueue = resolve; });
+  session.queue = previous.then(() => slot);
+  await waitForQueue(previous, abortSignal);
+  if (abortSignal?.aborted) {
+    releaseQueue();
+    return { output: "error: cancelled before shell execution", outcome: { status: cancellation(abortSignal) } };
+  }
   let cwd = session.cwd || root;
-  if (input.working_directory) {
-    try {
-      cwd = safePath(String(input.working_directory));
-    } catch (e) {
+  if (input?.working_directory) {
+    try { cwd = safePath(String(input.working_directory)); }
+    catch (error) {
       releaseQueue();
-      return {
-        output: `error: invalid working_directory: ${e instanceof Error ? e.message : String(e)}`,
-      };
+      return failure(`invalid working_directory: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   const sh: BgShell = {
-    id: nextShellId(),
-    command,
-    output: "",
-    done: false,
-    exitCode: null,
-    startedAt: Date.now(),
-    status: "running",
-    cwd,
-    notify: buildNotify(input, ctx),
+    id: nextShellId(), ownerKey, sessionKey, command,
+    output: "", outputChars: 0, done: false, exitCode: null,
+    startedAt: Date.now(), status: "running", cwd, notify: buildNotify(input, ctx),
   };
-  bgShells.set(sh.id, sh);
+  try { await registerShellJob(sh); }
+  catch (error) {
+    releaseQueue();
+    return failure(error instanceof Error ? error.message : String(error));
+  }
+  recordOutcome(ctx, callId, shellOutcome(sh));
   const live = makeLiveStream(sh, callId, ctx);
-  if (live) sh.onChunk = () => live();
-
-  /** Single place that settles a command so status/exit/timing stay consistent. */
+  sh.onChunk = live.update;
+  const result = (): ToolResult => {
+    const outcome = shellOutcome(sh);
+    recordOutcome(ctx, callId, outcome);
+    return { output: renderShell(sh), outcome };
+  };
   const settle = (status: BgShell["status"], code: number | null, note?: string) => {
     if (sh.done) return;
-    if (note) sh.output += `\n${note}`;
+    if (note) pushShellOutput(sh, `\n${note}\n`);
     sh.exitCode = code;
     sh.status = status;
     sh.done = true;
     sh.endedAt = Date.now();
-    live?.();
+    recordOutcome(ctx, callId, shellOutcome(sh));
+    live.update();
   };
 
-  // Spawn the command verbatim in its own shell: it owns its exit code and the
-  // shell dies with it, so there is nothing left to wait on once it finishes.
   let proc: ReturnType<typeof spawnShellCommand>;
   try {
+    abortSignal?.throwIfAborted();
     proc = spawnShellCommand(command, cwd);
-  } catch (e) {
+  } catch (error) {
+    const status = abortSignal?.aborted ? cancellation(abortSignal) : "failed";
+    settle(status === "timed_out" ? "timeout" : status, null,
+      `(failed to start command: ${error instanceof Error ? error.message : String(error)})`);
+    await finishShellTranscript(sh);
+    live.dispose(); sh.onChunk = undefined; sh.notify = undefined;
     releaseQueue();
-    settle("failed", 1);
-    return { output: `error: failed to start shell: ${e instanceof Error ? e.message : String(e)}` };
+    return result();
   }
   sh.proc = proc;
   session.running.add(proc);
-
-  const kill = () => killShellProcess(proc);
-  const onAbort = () => {
-    settle("aborted", sh.exitCode ?? 130, "(aborted)");
-    kill();
+  const stop = (timeout = false) => {
+    if (sh.done) return;
+    settle(timeout ? "timeout" : "aborted", null,
+      timeout ? "(terminal deadline reached; command killed)" : "(command aborted)");
+    killShellProcess(proc);
   };
-  abortSignal?.addEventListener("abort", onAbort);
-
-  const onData = (d: Buffer | string) => {
-    try { pushShellOutput(sh, d.toString()); } catch { /* ignore */ }
+  const onAbort = () => stop(cancellation(abortSignal) === "timed_out");
+  sh.abort = () => stop();
+  abortSignal?.addEventListener("abort", onAbort, { once: true });
+  const lifetime = setTimeout(() => stop(true), BACKGROUND_LIFETIME_MS);
+  lifetime.unref?.();
+  sh.cleanup = () => {
+    clearTimeout(lifetime);
+    abortSignal?.removeEventListener("abort", onAbort);
+    sh.abort = undefined;
+    sh.notify = undefined;
   };
+  // setEncoding retains incomplete UTF-8 sequences between pipe chunks.
+  proc.stdout?.setEncoding("utf8");
+  proc.stderr?.setEncoding("utf8");
+  const onData = (data: string) => pushShellOutput(sh, data);
   proc.stdout?.on("data", onData);
   proc.stderr?.on("data", onData);
-  proc.on("error", (error) => {
-    settle("failed", sh.exitCode ?? 1, `(failed to run command: ${error.message})`);
-  });
-  // 'close' (not 'exit') so all stdio has been flushed before we settle.
-  proc.on("close", (code, signal) => {
+  proc.once("error", error => settle("failed", null, `(failed to run command: ${error.message})`));
+  // close follows drained stdout/stderr; exit alone may miss the final output.
+  proc.once("close", (code, signal) => {
     session.running.delete(proc);
     if (signal) sh.signal = String(signal);
-    const exit = code ?? (signal ? 143 : 0);
-    if (sh.status === "aborted" || sh.done) {
-      sh.exitCode = sh.exitCode ?? exit;
-      return;
-    }
-    settle(exit === 0 ? "completed" : "failed", exit);
+    if (!sh.done) {
+      settle(code === 0 && !signal ? "completed" : "failed", code);
+      if (sh.status === "completed") applyCwdSideEffect(session, command);
+    } else if (code !== null) sh.exitCode = code;
+    recordOutcome(ctx, callId, shellOutcome(sh));
+    sh.cleanup?.(); sh.cleanup = undefined;
+    sh.proc = undefined;
+    proc.stdout?.off("data", onData); proc.stderr?.off("data", onData);
+    void finishShellTranscript(sh);
   });
-  // Output is pushed by the stream listeners; pump only refreshes timing.
-  sh.pump = () => { /* event-driven; nothing to pull */ };
-
-  const waitMs = blockMs <= 0 ? 0 : Math.min(blockMs, SHELL_HARD_WALL_MS);
+  if (abortSignal?.aborted) onAbort();
   try {
-    await waitForShell(sh, waitMs, undefined, abortSignal);
-
-    if (abortSignal?.aborted && !sh.done) {
-      settle("aborted", sh.exitCode ?? 130, "(aborted / timed out)");
-      kill();
-    } else if (!sh.done) {
-      // Foreground expiry is not a failure: the command keeps running and stays
-      // observable through AwaitShell (dev servers, watchers, long builds).
-      sh.status = "backgrounded";
-      live?.();
-      setTimeout(() => {
-        if (!sh.done) {
-          settle("timeout", sh.exitCode ?? 124, "(background limit reached after 10m — command killed)");
-          kill();
-        }
-      }, 600_000).unref?.();
-    } else if (sh.status === "completed") {
-      // Only a clean `cd` moves the run's working directory.
-      applyCwdSideEffect(session, command);
-    }
-
-    return { output: renderShell(sh) };
-  } catch (e) {
-    settle("failed", 1, `(error: ${e instanceof Error ? e.message : String(e)})`);
-    kill();
-    return { output: renderShell(sh) };
+    await waitForShell(sh, blockMs, undefined, abortSignal);
+    if (abortSignal?.aborted) onAbort();
+    if (!sh.done) sh.status = "backgrounded";
+    if (sh.done && !sh.proc) await finishShellTranscript(sh);
+    return result();
+  } catch (error) {
+    settle("failed", null, `(error: ${error instanceof Error ? error.message : String(error)})`);
+    killShellProcess(proc);
+    return result();
   } finally {
-    abortSignal?.removeEventListener("abort", onAbort);
+    live.dispose();
+    if (sh.onChunk === live.update) sh.onChunk = undefined;
     releaseQueue();
+    // The abort subscription belongs to the process and is removed on close.
   }
 });
 
-// ---- AwaitShell (poll a backgrounded shell, or just sleep) ----
 export const awaitShellTool = defineTool("AwaitShell", false, async (input, abortSignal, callId, ctx) => {
-  const requestedBlock = Number(input?.block_until_ms);
-  const raw = Number.isFinite(requestedBlock) ? requestedBlock : 15_000;
-  const blockMs = raw <= 0 ? 0 : Math.min(raw, MAX_AWAIT_MS);
+  const requested = Number(input?.block_until_ms);
+  const blockMs = Math.min(MAX_AWAIT_MS, Math.max(0, Number.isFinite(requested) ? requested : DEFAULT_BLOCK_MS));
   const id = input?.shell_id ? String(input.shell_id) : "";
-
   if (!id) {
-    if (blockMs <= 0) return { output: "error: shell_id is required when block_until_ms is 0" };
+    if (blockMs <= 0) return failure("shell_id is required when block_until_ms is 0");
     const startedAt = Date.now();
-    await new Promise<void>((resolve) => {
-      const finish = () => {
-        clearTimeout(timer);
-        abortSignal?.removeEventListener("abort", onAbort);
-        resolve();
-      };
-      const onAbort = () => finish();
+    await new Promise<void>(resolve => {
+      const finish = () => { clearTimeout(timer); abortSignal?.removeEventListener("abort", finish); resolve(); };
       const timer = setTimeout(finish, blockMs);
       if (abortSignal?.aborted) finish();
-      else abortSignal?.addEventListener("abort", onAbort, { once: true });
+      else abortSignal?.addEventListener("abort", finish, { once: true });
     });
-    if (abortSignal?.aborted) return { output: `Sleep aborted after ${Date.now() - startedAt}ms.` };
-    return { output: `Slept for ${blockMs}ms.` };
+    return abortSignal?.aborted
+      ? { output: `Sleep aborted after ${Date.now() - startedAt}ms.`, outcome: { status: cancellation(abortSignal) } }
+      : { output: `Slept for ${blockMs}ms.`, outcome: { status: "completed" } };
   }
-
-  const sh = bgShells.get(id);
+  const sh = getOwnedShell(ctx?.shellOwnerKey ?? ctx?.shellSessionKey, id);
   if (!sh) {
-    if (/^toolu_|^call_/i.test(id)) {
-      return {
-        output: `error: "${id}" looks like a subagent/Task call id, not a background shell. Subagents are not shells — do not poll them with AwaitShell.`,
-      };
-    }
-    return { output: `error: no background shell with id ${id}` };
+    if (/^toolu_|^call_/i.test(id)) return failure(`"${id}" looks like a Task call id; subagents are not terminal jobs`);
+    return failure("terminal job is unavailable in this conversation (expired or unknown job)");
   }
-
+  recordOutcome(ctx, callId, shellOutcome(sh));
   let pattern: RegExp | undefined;
   if (input?.pattern) {
-    try {
-      pattern = new RegExp(String(input.pattern), "m");
-    } catch (e) {
-      return { output: `error: invalid pattern: ${e instanceof Error ? e.message : String(e)}` };
-    }
+    try { pattern = new RegExp(String(input.pattern), "m"); }
+    catch (error) { return failure(`invalid pattern: ${error instanceof Error ? error.message : String(error)}`); }
   }
-
-  const prevChunk = sh.onChunk;
   const live = makeLiveStream(sh, callId, ctx);
-  if (live) {
-    sh.onChunk = (chunk) => {
-      try { prevChunk?.(chunk); } catch { /* ignore */ }
-      live();
-    };
-  }
+  const listener = () => live.update();
+  sh.outputListeners ??= new Set();
+  sh.outputListeners.add(listener);
   try {
     await waitForShell(sh, blockMs, pattern, abortSignal);
-    try {
-      sh.pump?.();
-    } catch {
-      /* ignore */
-    }
-    return { output: renderShell(sh) };
-  } catch (e) {
+    if (sh.done && !sh.proc) await finishShellTranscript(sh);
+    const processOutcome = shellOutcome(sh);
+    const outcome = abortSignal?.aborted ? { ...processOutcome, status: cancellation(abortSignal) } : processOutcome;
+    recordOutcome(ctx, callId, outcome);
     return {
-      output: `error: AwaitShell failed: ${e instanceof Error ? e.message : String(e)}`,
+      output: `${abortSignal?.aborted ? "(wait cancelled; job status follows)\n" : ""}${renderShell(sh)}`,
+      outcome,
     };
   } finally {
-    sh.onChunk = prevChunk;
+    live.dispose();
+    sh.outputListeners.delete(listener);
   }
 });

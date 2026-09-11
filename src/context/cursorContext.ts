@@ -8,9 +8,8 @@
  */
 
 import * as os from "os";
-import * as path from "path";
 import { getWorkspaceRoot, getRecentFiles } from "./workspaceUtils";
-import { getActiveSelection, getCursorRules, listSkills, getGitContext, listRulesForPrompt } from "./workspaceContext";
+import { getActiveSelection, getOpenFiles, listSkills, getGitContext, listRulesForPrompt } from "./workspaceContext";
 
 function shellName(): string {
   if (process.platform === "win32") {
@@ -59,28 +58,29 @@ export async function buildUserInfoBlock(opts: {
     `<user_info>\nOS Version: ${process.platform} ${os.release()}\n\nShell: ${shellName()}\n\nWorkspace Path: ${root}\n\nIs directory a git repo: ${isRepo}\n\nToday's date: ${formatDate(now)}\n</user_info>`
   );
 
-  if (opts.enableWorkspaceContext !== false) {
-    // Rules: always-applied workspace rules + user rules.
-    const always = await listRulesForPrompt();
-    const userRules = (opts.userRules || "").trim();
-    if (always || userRules) {
-      let rules = `<rules>\nThe rules section has a number of possible rules/memories/context that you should consider. In each subsection, we provide instructions about what information the subsection contains and how you should consider/follow the contents of the subsection.`;
-      if (always) {
-        rules += `\n\n\n<always_applied_workspace_rules description="These are workspace-level rules that the agent must always follow.">\n${always}\n</always_applied_workspace_rules>`;
-      }
-      if (userRules) {
-        const split = userRules
-          .split(/\n{2,}/)
-          .map((r) => r.trim())
-          .filter(Boolean)
-          .map((r) => `<user_rule>${r}</user_rule>`)
-          .join("\n\n");
-        rules += `\n\n<user_rules description="These are rules set by the user that you should follow if appropriate.">\n${split}\n</user_rules>`;
-      }
-      rules += `\n</rules>`;
-      parts.push(rules);
+  // Explicit user instructions apply even when automatic workspace context
+  // is disabled; that setting controls only workspace discovery.
+  const always = opts.enableWorkspaceContext !== false ? await listRulesForPrompt() : "";
+  const userRules = (opts.userRules || "").trim();
+  if (always || userRules) {
+    let rules = `<rules>\nThe rules section has a number of possible rules/memories/context that you should consider. In each subsection, we provide instructions about what information the subsection contains and how you should consider/follow the contents of the subsection.`;
+    if (always) {
+      rules += `\n\n\n<always_applied_workspace_rules description="These are workspace-level rules that the agent must always follow.">\n${always}\n</always_applied_workspace_rules>`;
     }
+    if (userRules) {
+      const split = userRules
+        .split(/\n{2,}/)
+        .map((r) => r.trim())
+        .filter(Boolean)
+        .map((r) => `<user_rule>${r}</user_rule>`)
+        .join("\n\n");
+      rules += `\n\n<user_rules description="These are rules set by the user that you should follow if appropriate.">\n${split}\n</user_rules>`;
+    }
+    rules += `\n</rules>`;
+    parts.push(rules);
+  }
 
+  if (opts.enableWorkspaceContext !== false) {
     // Available skills.
     const skills = await listSkills();
     if (skills.length) {
@@ -101,12 +101,15 @@ export async function buildUserInfoBlock(opts: {
  * Cached.
  */
 export async function buildOpenFilesBlock(): Promise<string> {
-  const recent = getRecentFiles();
+  // The helper enumerates open tabs; it does not track recency or read files.
+  const tabs = [...new Set(getRecentFiles())];
+  const visible = getOpenFiles();
   const selection = getActiveSelection();
-  const lines = recent.length
-    ? recent.map((f) => `- ${f}`).join("\n")
+  const lines = tabs.length
+    ? tabs.map((f) => `- ${f}`).join("\n")
     : "(none)";
-  let block = `<open_and_recently_viewed_files>\nRecently viewed files (recent at the top, oldest at the bottom):\n${lines}\n\nUser currently doesn't have any open files in their IDE.\n\nNote: these files may or may not be relevant to the current conversation. Use the read file tool if you need to get the contents of some of them.\n</open_and_recently_viewed_files>`;
+  const visibleLines = visible.length ? visible.map((f) => `- ${f}`).join("\n") : "(none)";
+  let block = `<open_and_recently_viewed_files>\nOpen file tabs in this workspace:\n${lines}\n\nVisible editor files in this workspace:\n${visibleLines}\n\nNote: these files may or may not be relevant to the current conversation. Use the Read tool if you need their contents.\n</open_and_recently_viewed_files>`;
   if (selection) {
     block += `\n\n<active_selection>\n${selection}\n</active_selection>`;
   }

@@ -35,6 +35,7 @@ export type HookEvent =
 	| "beforeShell"
 	| "beforeMcp"
 	| "beforeReadFile"
+	| "beforeEdit"
 	| "afterEdit"
 	| "afterRun"
 	| "notification"
@@ -50,7 +51,7 @@ export interface HookDef {
 	enabled: boolean;
 }
 
-export type ProviderKind = "openai" | "anthropic" | "google" | "openrouter" | "ollama" | "llamacpp";
+export type ProviderKind = "openai" | "anthropic" | "google" | "openrouter" | "ollama" | "llamacpp" | "mimo" | "atlascloud" | "astraflow";
 
 /** Where a model can be served from: API provider kinds + OAuth account kinds. */
 export type ModelKind = ProviderKind | "claude-code" | "codex" | "antigravity";
@@ -104,7 +105,7 @@ export function providerEnabled(p: ProviderConfig): boolean {
 
 const effort = (value = "medium", values = ["none", "low", "medium", "high"]): ModelOption => ({ key: "reasoning_effort", label: "Reasoning effort", type: "select", values, value });
 const thinking = (value = "adaptive", values = ["disabled", "adaptive", "enabled"]): ModelOption => ({ key: "thinking", label: "Thinking", type: "select", values, value });
-const ctx = (values: string[], value: string): ModelOption => ({ key: "max_context", label: "Context", type: "select", values, value });
+const ctx = (values: string[], value: string): ModelOption => ({ key: "max_context", label: "Context budget", type: "select", values, value });
 
 /** Fallback context sizes for models with no catalog preset (custom / fetched). */
 export const DEFAULT_CONTEXT_VALUES = ["32k", "64k", "128k", "200k", "256k", "512k", "1m"];
@@ -129,46 +130,59 @@ export function parseContextLabel(v?: string): number {
 	return Math.floor(n);
 }
 
-/** Built-in catalog of popular coding models. Users can edit options per model. */
+/**
+ * Popular text/coding models, verified against provider docs on 2026-09-07.
+ * Context choices are OpenCursor working-context budgets up to the documented
+ * window; choosing a smaller budget does not change the provider's model.
+ * https://developers.openai.com/api/docs/models
+ * https://platform.claude.com/docs/en/models/overview
+ * https://ai.google.dev/gemini-api/docs/models
+ */
 export const MODEL_CATALOG: ModelDef[] = [
-	// OpenAI — GPT-5.6 family (Sol / Terra / Luna). `gpt-5.6` aliases to Sol.
-	// Effort: none|low|medium|high|xhigh|max. Context: 1.05M / 128k max out.
-	{ id: "gpt-5.6", name: "GPT-5.6", kind: ["openai", "codex"], options: [effort("high", ["none", "low", "medium", "high", "xhigh", "max"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
+	// OpenAI: Astra cannot disable reasoning. GPT-5.6's public API supports max,
+	// while Codex-specific orchestration modes are not public API effort levels.
+	{ id: "gpt-6-astra", name: "GPT-6 Astra", kind: ["openai", "codex"], options: [effort("medium", ["low", "medium", "high", "xhigh", "max"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
 	{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol", kind: ["openai", "codex"], options: [effort("high", ["none", "low", "medium", "high", "xhigh", "max"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
 	{ id: "gpt-5.6-terra", name: "GPT-5.6 Terra", kind: ["openai", "codex"], options: [effort("medium", ["none", "low", "medium", "high", "xhigh", "max"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
 	{ id: "gpt-5.6-luna", name: "GPT-5.6 Luna", kind: ["openai", "codex"], options: [effort("low", ["none", "low", "medium", "high", "xhigh", "max"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
-	// GPT-5.5 — effort none|low|medium(default)|high|xhigh (no max). 1.05M ctx.
+	{ id: "gpt-5.6", name: "GPT-5.6 (Sol alias)", kind: ["openai", "codex"], options: [effort("high", ["none", "low", "medium", "high", "xhigh", "max"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
 	{ id: "gpt-5.5", name: "GPT-5.5", kind: ["openai", "codex"], options: [effort("medium", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
-	// GPT-5.5 Pro — effort medium|high(default)|xhigh only. 1.05M ctx.
-	{ id: "gpt-5.5-pro", name: "GPT-5.5 Pro", kind: ["openai", "codex"], options: [effort("high", ["medium", "high", "xhigh"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
-	// GPT-5.4 — effort none(default)|low|medium|high|xhigh. 1.05M ctx.
+	// The standalone Pro slug is a public Responses API model, not a Codex preset.
+	{ id: "gpt-5.5-pro", name: "GPT-5.5 Pro", kind: "openai", options: [effort("high", ["medium", "high", "xhigh"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
 	{ id: "gpt-5.4", name: "GPT-5.4", kind: ["openai", "codex"], options: [effort("none", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
-	// GPT-5.4 mini — effort none(default)|low|medium|high|xhigh. 400k ctx.
 	{ id: "gpt-5.4-mini", name: "GPT-5.4 mini", kind: ["openai", "codex"], options: [effort("none", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "400k"], "400k")] },
-	{ id: "gpt-5.3-codex", name: "GPT-5.3 Codex", kind: ["openai", "codex"], options: [effort("high", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k"], "400k")] },
-	// Anthropic — IDs match Claude API (dateless aliases). Fable is the top tier;
-	// Opus 5 is the coding flagship. Adaptive thinking; effort low→max.
-	// Fable 5: thinking always on (disabled unsupported). 1M ctx native, 300k selectable.
-	{ id: "claude-fable-5", name: "Fable 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
-	// Opus 5: thinking on by default; disabled only at effort ≤ high. 1M native, 300k selectable.
-	{ id: "claude-opus-5", name: "Opus 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
-	// Sonnet 5: adaptive; disabled allowed. 1M native, 300k selectable.
-	{ id: "claude-sonnet-5", name: "Sonnet 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
-	// Opus 4.8/4.7: adaptive only (manual budget → 400).
-	{ id: "claude-opus-4-8", name: "Opus 4.8", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
-	{ id: "claude-opus-4-7", name: "Opus 4.7", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "200k")] },
-	// Sonnet 4.6: adaptive recommended; budget_tokens deprecated but accepted.
-	{ id: "claude-sonnet-4-6", name: "Sonnet 4.6", kind: ["anthropic", "claude-code"], options: [thinking("adaptive"), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "1m")] },
-	// Haiku 4.5 — API alias `claude-haiku-4-5` → dated `claude-haiku-4-5-20251001`.
-	// Manual extended thinking only (no adaptive). 200k ctx.
-	{ id: "claude-haiku-4-5", name: "Haiku 4.5", kind: ["anthropic", "claude-code"], options: [thinking("disabled", ["disabled", "enabled"]), ctx(["200k"], "200k")] },
-	// Google Gemini — Gemini 3 is current; served via OpenAI-compatible endpoint,
-	// which maps reasoning_effort to the thinking budget. 1M context.
-	{ id: "gemini-3-pro-preview", name: "Gemini 3 Pro", kind: "google", options: [effort("high", ["low", "medium", "high"]), ctx(["1m"], "1m")] },
-	{ id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", kind: "google", options: [effort("medium", ["none", "low", "medium", "high"]), ctx(["1m"], "1m")] },
-	{ id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro", kind: "google", options: [effort("high", ["low", "medium", "high"]), ctx(["1m"], "1m")] },
+	{ id: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark", kind: ["openai", "codex"], options: [effort("high", ["low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k"], "400k")] },
+	// Anthropic: Fable always thinks. Opus 5 can disable thinking only through
+	// high effort (optionsFor applies that dependent restriction).
+	{ id: "claude-fable-5-1", name: "Claude Fable 5.1", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	{ id: "claude-opus-5", name: "Claude Opus 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	{ id: "claude-sonnet-5", name: "Claude Sonnet 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5", kind: ["anthropic", "claude-code"], options: [thinking("disabled", ["disabled", "enabled"]), ctx(["200k"], "200k")] },
+	{ id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5 (2025-10-01)", kind: ["anthropic", "claude-code"], enabled: false, options: [thinking("disabled", ["disabled", "enabled"]), ctx(["200k"], "200k")] },
+	// Still-supported previous releases retain explicit capability presets.
+	{ id: "claude-fable-5", name: "Claude Fable 5", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	{ id: "claude-opus-4-8", name: "Claude Opus 4.8", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
+	{ id: "claude-opus-4-7", name: "Claude Opus 4.7", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["disabled", "adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["200k", "1m"], "200k")] },
+	{ id: "claude-opus-4-6", name: "Claude Opus 4.6", kind: ["anthropic", "claude-code"], options: [thinking("adaptive"), effort("high", ["low", "medium", "high", "max"]), ctx(["200k", "1m"], "1m")] },
+	{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", kind: ["anthropic", "claude-code"], options: [thinking("adaptive"), effort("high", ["low", "medium", "high", "max"]), ctx(["200k", "1m"], "1m")] },
+	{ id: "claude-opus-4-5", name: "Claude Opus 4.5", kind: ["anthropic", "claude-code"], enabled: false, options: [thinking("disabled", ["disabled", "enabled"]), effort("high", ["low", "medium", "high"]), ctx(["200k"], "200k")] },
+	// Google public API: 1,048,576 input tokens; 1m is a conservative local budget.
+	// Gemini 3.7/3.8 and Pro do not support minimal or fully disabled reasoning.
+	// Retired gemini-3-pro-preview is intentionally absent (shutdown 2026-03-09).
+	{ id: "gemini-3.8-flash", name: "Gemini 3.8 Flash", kind: "google", options: [effort("medium", ["low", "medium", "high"]), ctx(["128k", "256k", "1m"], "1m")] },
+	{ id: "gemini-3.7-flash", name: "Gemini 3.7 Flash", kind: "google", options: [effort("medium", ["low", "medium", "high"]), ctx(["128k", "256k", "1m"], "1m")] },
+	{ id: "gemini-3.6-flash", name: "Gemini 3.6 Flash", kind: "google", options: [effort("medium", ["minimal", "low", "medium", "high"]), ctx(["128k", "256k", "1m"], "1m")] },
+	{ id: "gemini-3.5-flash-lite", name: "Gemini 3.5 Flash-Lite", kind: "google", options: [effort("minimal", ["minimal", "low", "medium", "high"]), ctx(["128k", "256k", "1m"], "1m")] },
+	{ id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro (Preview)", kind: "google", options: [effort("high", ["low", "medium", "high"]), ctx(["128k", "256k", "1m"], "1m")] },
+	{ id: "gemini-3.1-pro-preview-customtools", name: "Gemini 3.1 Pro Custom Tools (Preview)", kind: "google", enabled: false, options: [effort("high", ["low", "medium", "high"]), ctx(["128k", "256k", "1m"], "1m")] },
+	{ id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite", kind: "google", options: [effort("minimal", ["minimal", "low", "medium", "high"]), ctx(["128k", "256k", "1m"], "1m")] },
+	{ id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", kind: "google", options: [effort("medium", ["minimal", "low", "medium", "high"]), ctx(["1m"], "1m")] },
 	{ id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", kind: "google", options: [effort("high", ["low", "medium", "high"]), ctx(["1m"], "1m")] },
 	{ id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", kind: "google", options: [effort("medium", ["none", "low", "medium", "high"]), ctx(["1m"], "1m")] },
+	{ id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash-Lite", kind: "google", enabled: false, options: [effort("none", ["none", "low", "medium", "high"]), ctx(["1m"], "1m")] },
+	// Xiaomi MIMO — OpenAI-compatible API. Reasoning models.
+	{ id: "mimo-v2.5-pro", name: "MIMO V2.5 Pro", kind: "mimo" },
+	{ id: "mimo-v2.5", name: "MIMO V2.5", kind: "mimo" },
 
 	// Models exposed by Google Antigravity accounts.
 	{ id: "gemini-3-flash-agent", name: "Gemini 3.5 Flash (High)", kind: "antigravity", enabled: true },
@@ -328,6 +342,9 @@ export const PROVIDER_PRESETS: Record<ProviderKind, { label: string; baseUrl: st
 	openrouter: { label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", needsKey: true },
 	ollama: { label: "Ollama", baseUrl: "http://localhost:11434/v1", needsKey: false },
 	llamacpp: { label: "llama.cpp", baseUrl: "http://localhost:8080/v1", needsKey: false },
+	mimo: { label: "Xiaomi MIMO", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", needsKey: true },
+	atlascloud: { label: "Atlas Cloud", baseUrl: "https://api.atlascloud.ai/v1", needsKey: true },
+	astraflow: { label: "Astraflow", baseUrl: "https://api-us-ca.umodelverse.ai/v1", needsKey: true },
 };
 
 const KEY = "ocursor.features";
@@ -399,12 +416,30 @@ export class FeatureStore {
 			// from the current catalog; only the user's selected `value` is persisted.
 			const savedValue = new Map(saved.map((o) => [o.key, o.value]));
 			return def.options.map((o) => {
-				const v = savedValue.get(o.key);
+				let v = savedValue.get(o.key);
 				if (v == null) return o;
+				if (o.key === "thinking") {
+					if (v === "false") v = "disabled";
+					if (v === "true") v = o.values?.includes("enabled") ? "enabled" : "adaptive";
+				}
+				// Updating presets must not enlarge a user's smaller working budget.
+				if (o.key === "max_context" && o.values && /^[\d.]+\s*[km]?$/i.test(v.trim())) {
+					const tokens = parseContextLabel(v);
+					const ceiling = Math.max(...o.values.map(parseContextLabel));
+					if (tokens > 0 && tokens <= ceiling) return { ...o, value: v, values: o.values.includes(v) ? o.values : [...o.values, v] };
+				}
 				if (o.values && !o.values.includes(v)) return o;
 				return { ...o, value: v };
 			});
-		})();
+		})().map((option) => ({ ...option, ...(option.values ? { values: [...option.values] } : {}) }));
+		// Opus 5's two controls are dependent: higher effort cannot disable thinking.
+		if (/^claude-opus-5(?:$|-)/.test(modelId) && base.some((o) => o.key === "thinking" && o.value === "disabled")) {
+			const option = base.find((o) => o.key === "reasoning_effort");
+			if (option) {
+				option.values = ["low", "medium", "high"];
+				if (!option.values.includes(option.value)) option.value = "high";
+			}
+		}
 		// Ensure every model exposes a context window (catalog or fallback dropdown).
 		if (!base.some((o) => o.key === "max_context")) {
 			const savedCtx = saved?.find((o) => o.key === "max_context")?.value;

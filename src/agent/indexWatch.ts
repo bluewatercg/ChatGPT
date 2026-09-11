@@ -11,9 +11,9 @@
 
 import * as vscode from "vscode";
 import * as path from "path";
-import { upsertFile, removeFile, buildIndex, setIndexingEnabled, warmIndex, isIndexingEnabled } from "./semanticIndex";
+import { upsertFile, removeFile, buildIndex, setIndexingEnabled, warmIndex, isIndexingEnabled, getStatus } from "./semanticIndex";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
-import { invalidateScanCache } from "./tools/fileScan";
+import { invalidateScanCache, IGNORE_POLICY_FILES } from "./tools/fileScan";
 import type { FeatureStore } from "../stores/featureStore";
 import { logError } from "../logging";
 
@@ -62,6 +62,12 @@ async function flush(): Promise<void> {
     pending.clear();
     for (const [abs, action] of batch) {
       try {
+        if (IGNORE_POLICY_FILES.includes(path.basename(abs))) {
+          invalidateScanCache();
+          if (getStatus(root).indexing) pending.set(abs, action);
+          else await buildIndex(root);
+          continue;
+        }
         if (action === "del") await removeFile(root, abs);
         else await upsertFile(root, abs);
       } catch (error) {

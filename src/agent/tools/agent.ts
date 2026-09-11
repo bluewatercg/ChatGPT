@@ -7,12 +7,12 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-import * as fs from "fs/promises";
 import * as path from "path";
+import { writeTodos, readTodos } from "./todoState";
 import type { Mode } from "../types";
 import { getWorkspaceRoot } from "../../context/workspaceUtils";
-import { pendingChanges } from "../../stores/pendingChanges";
-import { defineTool, type AskQuestionItem, type TodoItem } from "./types";
+import { mutateFile } from "../../stores/fileMutations";
+import { defineTool, type AskQuestionItem } from "./types";
 import {
   getSubagentRunner,
   getQuestionAsker,
@@ -22,40 +22,19 @@ import {
 } from "./shared";
 
 // ---- TodoWrite ----
-export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abortSignal, _callId, ctx) => {
-  if (!ctx) return { output: "error: todo context unavailable" };
-  const incoming: TodoItem[] = Array.isArray(input.todos) ? input.todos : [];
-  if (input.merge) {
-    const byId = new Map(ctx.todos.map((t) => [t.id, t]));
-    for (const t of incoming) byId.set(t.id, { ...byId.get(t.id), ...t });
-    ctx.todos = [...byId.values()];
-  } else {
-    ctx.todos = incoming;
-  }
-  const render = ctx.todos
-    .map((t) => {
-      const mark =
-        t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-      return `${mark} ${t.content}`;
-    })
-    .join("\n");
-  return { output: `Updated todos:\n${render}` };
-});
+export const todoWriteTool = defineTool("TodoWrite", false, async (input, _signal, _id, ctx) => writeTodos(input, ctx));
 
 // ---- TodoRead ----
-export const todoReadTool = defineTool("TodoRead", false, async (_input, _abortSignal, _callId, ctx) => {
-  if (!ctx) return { output: "error: todo context unavailable" };
-  if (!ctx.todos.length) return { output: "(no todos)" };
-  return { output: ctx.todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };
-});
+export const todoReadTool = defineTool("TodoRead", false, async (_input, _signal, _id, ctx) => readTodos(ctx));
 
 // ---- AskQuestion (interactive wizard form in the chat UI) ----
 export const askQuestionTool = defineTool("AskQuestion", false, async (input, abortSignal, callId, ctx) => {
   const asker = ctx?.askUser ?? getQuestionAsker();
   if (!asker) return { output: "error: cannot ask questions in this context" };
 
-  // Cursor shape: questions:[{id, prompt, options:[{id,label}], allow_multiple}], title.
+// Cursor shape: questions:[{id, prompt, options:[{id,label}], allow_multiple}], title.
   // Back-compat: also accept {question, options:[string], multiple} and header.
+  // Structured inputs: {type: "text"|"textArea"|"number"|"date", required, placeholder}.
   const questions: AskQuestionItem[] = Array.isArray(input?.questions)
     ? input.questions
         .map((q: any) => ({
@@ -64,6 +43,9 @@ export const askQuestionTool = defineTool("AskQuestion", false, async (input, ab
             ? q.options.map((o: any) => (typeof o === "string" ? o : String(o?.label ?? o?.id ?? "")))
             : undefined,
           multiple: !!(q?.allow_multiple ?? q?.multiple),
+          type: typeof q?.type === "string" ? (q.type as AskQuestionItem["type"]) : undefined,
+          required: q?.required === true,
+          placeholder: typeof q?.placeholder === "string" ? q.placeholder : undefined,
         }))
         .filter((q: AskQuestionItem) => q.question)
     : [];
@@ -105,6 +87,23 @@ export const taskTool = defineTool("Task", false, async (input, abortSignal, cal
   return { output: result };
 });
 
+// ---- Wait (plain sleep) ----
+const MAX_WAIT_MS = 120_000;
+export const waitTool = defineTool("Wait", false, async (input, abortSignal) => {
+  const requested = Number(input?.ms);
+  if (!Number.isFinite(requested) || requested < 0) return { output: "error: ms must be a non-negative number" };
+  const ms = Math.min(MAX_WAIT_MS, Math.round(requested));
+  const startedAt = Date.now();
+  await new Promise<void>((resolve) => {
+    const finish = () => { clearTimeout(timer); abortSignal?.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    if (abortSignal?.aborted) finish();
+    else abortSignal?.addEventListener("abort", finish, { once: true });
+  });
+  if (abortSignal?.aborted) return { output: `Wait aborted after ${Date.now() - startedAt}ms.`, outcome: { status: "aborted" } };
+  return { output: `Waited ${ms}ms${ms < requested ? ` (capped from ${Math.round(requested)})` : ""}.`, outcome: { status: "completed" } };
+});
+
 // ---- SwitchMode ----
 export const switchModeTool = defineTool("SwitchMode", false, async (input, _signal, _callId, ctx) => {
   const target = String(input?.target_mode_id ?? "").trim().toLowerCase();
@@ -116,26 +115,17 @@ export const switchModeTool = defineTool("SwitchMode", false, async (input, _sig
   return { output: ctx.switchMode(target as Mode) };
 });
 
-// ---- WritePlan (plan mode only) ----
-export const writePlanTool = defineTool("WritePlan", false, async (input) => {
+// ---- WritePlan (allowed in plan, agent, and debug modes) ----
+export const writePlanTool = defineTool("WritePlan", true, async (input, signal, _callId, ctx) => {
   const root = getWorkspaceRoot();
-  const dir = path.join(root, ".plans");
-  await fs.mkdir(dir, { recursive: true });
-  const file = `${slugify(input.title)}.md`;
-  const rel = `.plans/${file}`;
-  const p = path.join(dir, file);
+  const rel = `.plans/${slugify(input.title)}.md`;
   const body = `# ${String(input.title || "Plan").trim()}\n\n${String(input.content || "").trim()}\n`;
-  let existedBefore = false;
-  let original = "";
-  try {
-    original = await fs.readFile(p, "utf8");
-    existedBefore = true;
-  } catch {}
-  await fs.writeFile(p, body, "utf8");
-  pendingChanges.record(rel, original, body, existedBefore);
-  return {
-    output: `wrote plan to ${rel}`,
-    diff: makeDiff(rel, original, body),
-    startLine: firstDiffLine(original, body),
-  };
+  return mutateFile(path.join(root, rel), { signal, owner: ctx?.changeOwner }, ({ data }) => {
+    const original = data?.toString("utf8") ?? "";
+    return { data: Buffer.from(body), result: {
+      output: `wrote plan to ${rel}`,
+      diff: makeDiff(rel, original, body),
+      startLine: firstDiffLine(original, body),
+    } };
+  });
 });

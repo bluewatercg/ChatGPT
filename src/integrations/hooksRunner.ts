@@ -11,6 +11,7 @@ import { spawn } from "child_process";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import type { HookDef } from "../stores/featureStore";
 import { listExternalHooks, type ExternalHook } from "./externalHooks";
+import { killShellProcess } from "../agent/tools/shared";
 
 /**
  * Trigger table: each unified event maps to the equivalent
@@ -24,6 +25,7 @@ const TRIGGERS = {
 	beforeShell: { cursor: ["beforeShellExecution"], claude: ["PreToolUse"], claudeTool: "Bash", blocking: true },
 	beforeMcp: { cursor: ["beforeMCPExecution"], claude: ["PreToolUse"], blocking: true },
 	beforeReadFile: { cursor: ["beforeReadFile"], claude: ["PreToolUse"], claudeTool: "Read", blocking: true },
+	beforeEdit: { cursor: [], claude: ["PreToolUse"], blocking: true },
 	afterEdit: { cursor: ["afterFileEdit"], claude: ["PostToolUse"], claudeTool: "Edit", blocking: false },
 	afterRun: { cursor: ["stop"], claude: ["Stop"], blocking: false },
 	notification: { cursor: [], claude: ["Notification"], blocking: false },
@@ -64,35 +66,52 @@ function externalFor(event: TriggerEvent, tool?: string): ExternalHook[] {
 interface HookResult {
 	code: number | null;
 	stdout: string;
+	stderr?: string;
+	failure?: string;
 }
 
 const HOOK_TIMEOUT_MS = 30_000;
 
 /** Run one hook command with a JSON payload on stdin; resolves with exit code + stdout. */
-function runHook(command: string, root: string | undefined, env: NodeJS.ProcessEnv, stdinPayload: object): Promise<HookResult> {
+function runHook(command: string, root: string | undefined, env: NodeJS.ProcessEnv, stdinPayload: object, signal?: AbortSignal): Promise<HookResult> {
 	return new Promise((resolve) => {
+		if (signal?.aborted) { resolve({ code: null, stdout: "", failure: "hook cancelled" }); return; }
 		const shell = process.platform === "win32" ? "powershell.exe" : "bash";
 		const args = process.platform === "win32" ? ["-Command", command] : ["-c", command];
 		try {
-			const c = spawn(shell, args, { cwd: root, env, detached: false, stdio: ["pipe", "pipe", "ignore"] });
+			const c = spawn(shell, args, { cwd: root, env, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
 			let stdout = "";
-			c.stdout?.on("data", (d) => (stdout += String(d)));
+			let stderr = "";
+			let settled = false;
+			const finish = (result: HookResult) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				resolve(result);
+			};
+			const stop = (failure: string) => {
+				killShellProcess(c);
+				finish({ code: null, stdout, stderr, failure });
+			};
+			const onAbort = () => stop("hook cancelled");
+			const timer = setTimeout(() => stop("hook timed out after 30 seconds"), HOOK_TIMEOUT_MS);
+			signal?.addEventListener("abort", onAbort, { once: true });
+			c.stdout?.on("data", (d) => {
+				stdout += String(d);
+				if (stdout.length > 65_536) stop("hook output exceeded 64 KiB");
+			});
+			c.stderr?.on("data", (d) => { stderr = (stderr + String(d)).slice(-65_536); });
+			// Hooks may exit without reading stdin; their exit status still decides
+			// the verdict. EPIPE must not crash the extension host.
+			c.stdin?.on("error", () => {});
 			c.stdin?.write(JSON.stringify(stdinPayload));
 			c.stdin?.end();
-			const t = setTimeout(() => {
-				c.kill();
-				resolve({ code: null, stdout });
-			}, HOOK_TIMEOUT_MS);
-			c.on("close", (code) => {
-				clearTimeout(t);
-				resolve({ code, stdout });
-			});
-			c.on("error", () => {
-				clearTimeout(t);
-				resolve({ code: null, stdout });
-			});
-		} catch {
-			resolve({ code: null, stdout: "" });
+			if (process.platform !== "win32") c.once("exit", () => killShellProcess(c));
+			c.on("close", (code) => finish({ code, stdout, stderr }));
+			c.on("error", (error) => finish({ code: null, stdout, stderr, failure: `hook failed: ${error.message}` }));
+		} catch (error) {
+			resolve({ code: null, stdout: "", failure: `hook failed: ${error instanceof Error ? error.message : String(error)}` });
 		}
 	});
 }
@@ -104,10 +123,19 @@ function runHook(command: string, root: string | undefined, env: NodeJS.ProcessE
  * Returns a reason string when blocked, undefined otherwise.
  */
 function verdictOf(r: HookResult): string | undefined {
-	if (r.code === 2) return r.stdout.trim() || "blocked by hook (exit code 2)";
+	if (r.failure) return r.failure;
+	if (r.code === 2) return r.stderr?.trim() || r.stdout.trim() || "blocked by hook (exit code 2)";
 	try {
 		const j = JSON.parse(r.stdout.trim());
 		if (j && typeof j === "object") {
+			const native = j.hookSpecificOutput;
+			if (native?.permissionDecision === "deny" || native?.decision?.behavior === "deny") {
+				return native.permissionDecisionReason || native.decision?.message || j.reason || "blocked by hook";
+			}
+			// A native request for confirmation must never silently allow execution.
+			if (native?.permissionDecision === "ask" || native?.permissionDecision === "defer") {
+				return native.permissionDecisionReason || "hook requires user confirmation before this action";
+			}
 			if (j.permission === "deny" || j.decision === "block" || j.continue === false) {
 				return j.userMessage || j.agentMessage || j.reason || j.stopReason || "blocked by hook";
 			}
@@ -120,6 +148,13 @@ function verdictOf(r: HookResult): string | undefined {
 
 /** Build the native stdin JSON payload for a Cursor or Claude Code hook. */
 function nativePayload(h: ExternalHook, root: string | undefined, context: Record<string, string>, tool?: string): object {
+	let toolInput: object | undefined;
+	if (context.tool_input) {
+		try {
+			const parsed = JSON.parse(context.tool_input);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) toolInput = parsed;
+		} catch { /* malformed optional context does not replace the native input */ }
+	}
 	if (h.source.startsWith("cursor")) {
 		// Cursor hooks.json protocol: snake_case fields + event-specific keys.
 		const base: Record<string, unknown> = {
@@ -130,6 +165,7 @@ function nativePayload(h: ExternalHook, root: string | undefined, context: Recor
 		if (context.command !== undefined) base.command = context.command;
 		if (context.path !== undefined) base.file_path = context.path;
 		if (tool) base.tool_name = tool;
+		if (toolInput) base.tool_input = toolInput;
 		return base;
 	}
 	// Claude Code settings.json protocol.
@@ -140,7 +176,7 @@ function nativePayload(h: ExternalHook, root: string | undefined, context: Recor
 	if (context.prompt !== undefined) base.prompt = context.prompt;
 	if (h.event === "PreToolUse" || h.event === "PostToolUse") {
 		base.tool_name = tool ?? (context.command !== undefined ? "Bash" : context.path !== undefined ? "Edit" : "");
-		base.tool_input = context.command !== undefined ? { command: context.command } : context.path !== undefined ? { file_path: context.path } : {};
+		base.tool_input = toolInput ?? (context.command !== undefined ? { command: context.command } : context.path !== undefined ? { file_path: context.path } : {});
 	}
 	if (context.message !== undefined) base.message = context.message;
 	return base;
@@ -158,7 +194,9 @@ function launchesFor(hooks: HookDef[], event: TriggerEvent, root: string | undef
 		if (h.enabled && h.event === event) out.push({ command: h.command, payload: ownPayload(event, root, context, tool) });
 	}
 	for (const h of externalFor(event, tool)) {
-		out.push({ command: h.command, payload: nativePayload(h, root, context, tool) });
+		const trigger = TRIGGERS[event];
+		const nativeTool = tool ?? ("claudeTool" in trigger ? trigger.claudeTool : undefined);
+		out.push({ command: h.command, payload: nativePayload(h, root, context, nativeTool) });
 	}
 	return out;
 }
@@ -183,14 +221,15 @@ export function runHooks(hooks: HookDef[], event: TriggerEvent, context: Record<
  * Blocking variant for "before" events: runs all hooks, waits, and returns a
  * block reason if any hook vetoed (exit code 2 or JSON verdict) — undefined otherwise.
  */
-export async function runBlockingHooks(hooks: HookDef[], event: TriggerEvent, context: Record<string, string> = {}, tool?: string): Promise<string | undefined> {
+export async function runBlockingHooks(hooks: HookDef[], event: TriggerEvent, context: Record<string, string> = {}, tool?: string, signal?: AbortSignal): Promise<string | undefined> {
+	if (signal?.aborted) return "hook cancelled";
 	if (!TRIGGERS[event].blocking) {
 		runHooks(hooks, event, context, tool);
 		return undefined;
 	}
 	const root = getWorkspaceRoot();
 	const env = envFor(context);
-	const results = await Promise.all(launchesFor(hooks, event, root, context, tool).map((l) => runHook(l.command, root, env, l.payload)));
+	const results = await Promise.all(launchesFor(hooks, event, root, context, tool).map((l) => runHook(l.command, root, env, l.payload, signal)));
 	for (const r of results) {
 		const reason = verdictOf(r);
 		if (reason) return reason;

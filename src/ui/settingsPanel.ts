@@ -22,7 +22,7 @@ import * as llama from "../agent/llamacpp";
 import type { LlamacppModel } from "../agent/llamacpp";
 import * as ollama from "../agent/ollama";
 import * as oauth from "../agent/oauth";
-import { getUsage, resetUsage } from "../stores/usageStore";
+import { getUsage, resetUsage, flushUsage, onUsageChanged } from "../stores/usageStore";
 import { listExternalHooks, saveExternalHook, deleteExternalHook } from "../integrations/externalHooks";
 import { getAllModels, onAllModels, refreshAllModels, applyEmbedModel } from "../stores/modelRegistry";
 
@@ -31,6 +31,10 @@ export class SettingsPanel {
   public static readonly viewType = "ocursor.settingsPanel";
   private readonly _panel: vscode.WebviewPanel;
   private _disposables: vscode.Disposable[] = [];
+  private _resettingUsage = false;
+  private readonly _resettingQuota = new Set<string>();
+  private readonly _quotaReads = new Map<string, Promise<oauth.OAuthUsage>>();
+  private readonly _lifetime = new AbortController();
 
   public static createOrShow(context: vscode.ExtensionContext, settingsManager: SettingsManager, featureStore: FeatureStore, section?: string) {
     const column = vscode.window.activeTextEditor ? vscode.window.activeTextEditor.viewColumn : undefined;
@@ -102,6 +106,10 @@ export class SettingsPanel {
     this._disposables.push(
       oauth.onOAuthStatus((s) => this._panel.webview.postMessage({ type: "oauthStatus", status: s }))
     );
+
+    this._disposables.push({
+      dispose: onUsageChanged((usage) => this._panel.webview.postMessage({ type: "usageData", usage })),
+    });
 
     this._panel.webview.onDidReceiveMessage(
       async (message) => {
@@ -441,11 +449,16 @@ export class SettingsPanel {
 
           // ---- Usage & Quota ----
           case "getUsage":
-            this._panel.webview.postMessage({ type: "usageData", usage: getUsage() });
+            try {
+              await flushUsage();
+              this._panel.webview.postMessage({ type: "usageData", usage: getUsage() });
+              this._usageActionResult(message.requestId, "refresh", "success");
+            } catch (error) {
+              this._usageActionResult(message.requestId, "refresh", "error", error);
+            }
             break;
           case "resetUsage":
-            await resetUsage();
-            this._panel.webview.postMessage({ type: "usageData", usage: getUsage() });
+            await this._resetUsage(message.requestId);
             break;
 
           // ---- OAuth accounts (Claude Code / Codex) ----
@@ -453,20 +466,43 @@ export class SettingsPanel {
             this._panel.webview.postMessage({ type: "oauthStatus", status: oauth.getStatus() });
             break;
           case "oauthLogin":
-            oauth.login(message.kind).catch((e) =>
-              this._panel.webview.postMessage({ type: "oauthStatus", status: { ...oauth.getStatus(), errors: { ...oauth.getStatus().errors, [message.kind]: String(e?.message || e) } } })
-            );
+            oauth.login(message.kind).catch((error) => this._postOAuthError(message.kind, error));
             break;
+          case "oauthOpenLogin":
+            oauth.openLoginInBrowser(message.kind).catch((error) => this._postOAuthError(message.kind, error));
+            break;
+          case "oauthCopyLogin": {
+            const status = oauth.getStatus();
+            if (status.pending !== message.kind || !status.authorizationUrl) {
+              this._postOAuthError(message.kind, new Error("No login in progress — click Add account first."));
+              break;
+            }
+            try {
+              // Copy the host's active URL, never a URL supplied by the webview.
+              await vscode.env.clipboard.writeText(status.authorizationUrl);
+              this._panel.webview.postMessage({ type: "oauthLinkCopied", kind: status.pending, authorizationUrl: status.authorizationUrl });
+            } catch (error) {
+              this._postOAuthError(message.kind, error);
+            }
+            break;
+          }
           case "oauthCancel":
             oauth.cancelLogin(message.kind);
             break;
-          case "oauthManualCallback":
+          case "oauthManualCallback": {
+            const authorizationUrl = oauth.getStatus().authorizationUrl;
             try {
               await oauth.completeManual(message.kind, message.url);
-            } catch {
-              // Error already surfaced via oauthStatus.errors.
+            } catch (error) {
+              const current = oauth.getStatus();
+              // A cancelled/replaced exchange must not overwrite a newer login.
+              // A failed exchange may already have cleared its URL and saved its error.
+              if (current.authorizationUrl === authorizationUrl || (!current.authorizationUrl && current.errors[message.kind as oauth.OAuthKind])) {
+                this._postOAuthError(message.kind, error);
+              }
             }
             break;
+          }
           case "oauthDisconnect":
             await oauth.disconnect(message.id);
             this.featureStore.notifyChanged();
@@ -478,25 +514,12 @@ export class SettingsPanel {
           case "oauthSetBalance":
             await oauth.setBalanceStrategy(message.strategy);
             break;
-          case "oauthLimits": {
-            try {
-              const usage = await oauth.getAccountLimits(message.id);
-              this._panel.webview.postMessage({ type: "oauthLimits", id: message.id, limits: usage.limits, resetCredits: usage.resetCredits });
-            } catch (e) {
-              this._panel.webview.postMessage({ type: "oauthLimits", id: message.id, limits: [], error: String((e as any)?.message || e) });
-            }
+          case "oauthLimits":
+            await this._sendAccountLimits(message.id, message.requestId);
             break;
-          }
-          case "oauthResetCredit": {
-            const res = await oauth.consumeCodexResetCredit(message.id);
-            this._panel.webview.postMessage({ type: "oauthResetResult", id: message.id, ok: res.ok, message: res.message });
-            // Refresh limits after a reset attempt.
-            try {
-              const usage = await oauth.getAccountLimits(message.id);
-              this._panel.webview.postMessage({ type: "oauthLimits", id: message.id, limits: usage.limits, resetCredits: usage.resetCredits });
-            } catch { /* ignore */ }
+          case "oauthResetCredit":
+            await this._resetAccountQuota(message.id, message.requestId);
             break;
-          }
 
           // ---- Ollama ----
           case "ollamaGet": {
@@ -548,6 +571,75 @@ export class SettingsPanel {
       null,
       this._disposables
     );
+  }
+
+  private _usageActionResult(requestId: unknown, action: "refresh" | "reset", status: "success" | "cancelled" | "error", error?: unknown) {
+    this._panel.webview.postMessage({ type: "usageActionResult", requestId, action, status,
+      ...(error ? { error: String((error as Error)?.message || error) } : {}),
+    });
+  }
+
+  private async _resetUsage(requestId: unknown) {
+    if (this._resettingUsage) {
+      this._usageActionResult(requestId, "reset", "error", "A usage reset is already awaiting confirmation or being saved.");
+      return;
+    }
+    this._resettingUsage = true;
+    try {
+      const choice = await vscode.window.showWarningMessage("Reset all recorded token usage?", {
+        modal: true, detail: "This clears locally recorded token usage. Your account quota and reset credits are unchanged.",
+      }, "Reset Usage");
+      if (choice !== "Reset Usage" || this._lifetime.signal.aborted) {
+        this._usageActionResult(requestId, "reset", "cancelled");
+        return;
+      }
+      await resetUsage();
+      this._panel.webview.postMessage({ type: "usageData", usage: getUsage() });
+      this._usageActionResult(requestId, "reset", "success");
+    } catch (error) {
+      this._usageActionResult(requestId, "reset", "error", error);
+    } finally {
+      this._resettingUsage = false;
+    }
+  }
+
+  private _accountLimits(id: string): Promise<oauth.OAuthUsage> {
+    const pending = this._quotaReads.get(id);
+    if (pending) return pending;
+    const read = oauth.getAccountLimits(id, this._lifetime.signal).finally(() => {
+      if (this._quotaReads.get(id) === read) this._quotaReads.delete(id);
+    });
+    this._quotaReads.set(id, read);
+    return read;
+  }
+
+  private async _sendAccountLimits(id: string, requestId?: string) {
+    try {
+      const usage = await this._accountLimits(id);
+      this._panel.webview.postMessage({ type: "oauthLimits", id, requestId, limits: usage.limits, resetCredits: usage.resetCredits });
+    } catch (error) {
+      this._panel.webview.postMessage({ type: "oauthLimits", id, requestId, error: String((error as Error)?.message || error) });
+    }
+  }
+
+  private async _resetAccountQuota(id: string, requestId?: string) {
+    if (this._resettingQuota.has(id)) {
+      this._panel.webview.postMessage({ type: "oauthResetResult", id, requestId, ok: false, message: "A quota reset is already in progress. Refresh limits before trying again." });
+      await this._sendAccountLimits(id, requestId);
+      return;
+    }
+    this._resettingQuota.add(id);
+    try {
+      const result = await oauth.consumeCodexResetCredit(id, this._lifetime.signal);
+      this._panel.webview.postMessage({ type: "oauthResetResult", id, requestId, ok: result.ok, message: result.message });
+    } catch (error) {
+      this._panel.webview.postMessage({ type: "oauthResetResult", id, requestId, ok: false, message: String((error as Error)?.message || error) });
+    } finally {
+      // Discard any pre-reset quota read; it cannot confirm the reset's outcome.
+      this._quotaReads.delete(id);
+      try { await this._sendAccountLimits(id, requestId); }
+      finally { this._resettingQuota.delete(id); }
+    }
   }
 
   private async _handleFetchModels(apiBaseUrl: string, apiKey: string, anthropic?: boolean, providerId?: string) {
@@ -608,6 +700,14 @@ export class SettingsPanel {
     const llamacppModels = [...f.llamacppModels.filter((m) => m.id !== model.id), model];
     await this.featureStore.set({ llamacppModels });
     await this._sendFeatures();
+  }
+
+  private _postOAuthError(kind: oauth.OAuthKind, error: unknown) {
+    const status = oauth.getStatus();
+    this._panel.webview.postMessage({
+      type: "oauthStatus",
+      status: { ...status, errors: { ...status.errors, [kind]: String((error as Error)?.message || error) } },
+    });
   }
 
   private async _sendOllamaModels() {
@@ -677,6 +777,7 @@ export class SettingsPanel {
   }
 
   public dispose() {
+    this._lifetime.abort();
     SettingsPanel.currentPanel = undefined;
     this._panel.dispose();
     while (this._disposables.length) {

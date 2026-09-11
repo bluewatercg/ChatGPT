@@ -7,44 +7,39 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-import * as fs from "fs/promises";
-import * as path from "path";
-import { safePath } from "../../context/workspaceUtils";
+import { writeTool } from "./files";
 import { mcpManager } from "../../integrations/mcpClient";
 import { defineTool } from "./types";
 
 // ---- CallMcpTool ----
-export const callMcpToolTool = defineTool("CallMcpTool", true, async (input) => {
-  const server = String(input?.server ?? "").trim();
-  const toolName = String(input?.toolName ?? "").trim();
-  if (!server || !toolName) return { output: "error: CallMcpTool requires 'server' and 'toolName'" };
-  const out = await mcpManager.callTool(`mcp__${server}__${toolName}`, input?.arguments ?? {});
-  return { output: out };
-});
+export const callMcpToolTool = defineTool("CallMcpTool", true, async () => ({
+  output: "error: MCP tool execution requires the agent's guarded dispatcher",
+}));
 
 // ---- FetchMcpResource ----
-export const fetchMcpResourceTool = defineTool("FetchMcpResource", true, async (input) => {
+export const fetchMcpResourceTool = defineTool("FetchMcpResource", true, async (input, signal, callId, ctx) => {
   const server = String(input?.server ?? "").trim();
   const uri = String(input?.uri ?? "").trim();
   if (!server || !uri) return { output: "error: FetchMcpResource requires 'server' and 'uri'" };
 
-  const content = await mcpManager.readResource(server, uri);
+  const content = await mcpManager.readResource(server, uri, signal);
   if (content.startsWith("error:")) return { output: content };
 
   const downloadPath = input?.downloadPath ? String(input.downloadPath) : "";
   if (downloadPath) {
-    const dest = safePath(downloadPath);
-    await fs.mkdir(path.dirname(dest), { recursive: true });
-    await fs.writeFile(dest, content, "utf8");
-    return { output: `Saved resource ${uri} to ${downloadPath}` };
+    signal?.throwIfAborted();
+    const veto = await ctx?.beforeResourceWrite?.(downloadPath, content, signal);
+    if (veto) return { output: `error: blocked by hook: ${veto}` };
+    signal?.throwIfAborted();
+    return writeTool.execute({ path: downloadPath, contents: content }, signal, callId, ctx);
   }
   return { output: content };
 });
 
 // ---- ListMcpResources ----
-export const listMcpResourcesTool = defineTool("ListMcpResources", false, async (input) => {
+export const listMcpResourcesTool = defineTool("ListMcpResources", false, async (input, signal) => {
   const filter = input?.server ? String(input.server) : "";
-  const resources = (await mcpManager.listResources()).filter((r) => !filter || r.server === filter);
+  const resources = (await mcpManager.listResources(signal)).filter((r) => !filter || r.server === filter);
   if (resources.length === 0) return { output: "No MCP resources available." };
   const lines = resources.map(
     (r) => `${r.server}\t${r.uri}${r.name ? `\t${r.name}` : ""}${r.mimeType ? `\t(${r.mimeType})` : ""}`

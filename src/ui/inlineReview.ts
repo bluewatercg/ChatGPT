@@ -139,7 +139,7 @@ function changeForEditor(editor: vscode.TextEditor) {
 
 function refreshEditor(editor: vscode.TextEditor) {
   const change = changeForEditor(editor);
-  if (!change) {
+  if (!change || change.previewOnly) {
     editor.setDecorations(addedDecoration, []);
     return;
   }
@@ -217,7 +217,7 @@ export function registerInlineReview(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeTextDocument((e) => {
       if (e.document.uri.scheme !== "file") return;
       for (const editor of vscode.window.visibleTextEditors) {
-        if (editor.document === e.document) refreshEditor(editor);
+        if (editor.document === e.document) scheduleSync();
       }
     })
   );

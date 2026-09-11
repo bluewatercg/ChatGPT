@@ -9,6 +9,8 @@
 
 import type { Turn } from "../../shared/turns";
 import type { ApprovalActionType } from "../../agent/approvalPolicy";
+import type { Step } from "../../agent/types";
+import type { ContextState } from "../../agent/contextState";
 
 /** An in-chat approval request awaiting the user's decision. */
 export interface PendingApproval {
@@ -27,6 +29,10 @@ export interface PendingApproval {
 
 /** State for one independent agent run, keyed by conversation id. */
 export interface RunSession {
+  /** Resolves only after the run and its cleanup have finished. */
+  done: Promise<void>;
+  resolveDone: () => void;
+  settled?: boolean;
   abort: AbortController;
   subagentAborts: Map<string, () => void>;
   pendingQuestions: Map<string, (answers: Record<string, string[]>) => void>;
@@ -34,6 +40,9 @@ export interface RunSession {
   pendingApprovals: Map<string, { info: PendingApproval; resolve: (ok: boolean) => void }>;
   /** Authoritative live UI turns, owned by the host so the run survives any webview churn. */
   turns: Turn[];
+  /** Live model transcript and checkpoint, saved alongside the rendered turns. */
+  history: Step[];
+  contextState: ContextState;
   /** Pending throttled persist timer. */
   persistTimer?: NodeJS.Timeout;
 }

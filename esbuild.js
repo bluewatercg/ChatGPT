@@ -1,4 +1,14 @@
+/*
+ * Copyright (c) 2026 Pawan Osman <https://github.com/PawanOsman>
+ *
+ * This file is part of OpenCursor — AI coding agent chat inside VS Code.
+ * https://github.com/PawanOsman/OpenCursor
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
 const esbuild = require("esbuild");
+const { hostBuildOptions } = require("./esbuild-options.cjs");
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -25,17 +35,14 @@ const esbuildProblemMatcherPlugin = {
 
 async function main() {
 	const ctx = await esbuild.context({
+		...hostBuildOptions,
 		entryPoints: [
 			'src/extension.ts'
 		],
-		bundle: true,
-		format: 'cjs',
 		minify: production,
 		sourcemap: !production,
 		sourcesContent: false,
-		platform: 'node',
 		outfile: 'dist/extension.js',
-		external: ['vscode', '@huggingface/transformers', '@huggingface/hub', 'onnxruntime-node', 'sharp'],
 		logLevel: 'silent',
 		plugins: [
 			/* add to the end of plugins array */

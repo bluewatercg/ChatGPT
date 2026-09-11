@@ -65,6 +65,8 @@ export interface OAuthStatus {
   accounts: OAuthAccountInfo[];
   /** Kind currently mid-login (waiting for the browser callback). */
   pending?: OAuthKind;
+  /** Current sign-in link; contains a PKCE challenge, never the verifier or account tokens. */
+  authorizationUrl?: string;
   /** Login errors keyed by kind. */
   errors: Partial<Record<OAuthKind, string>>;
   /** Load-balancing strategy for kinds with multiple accounts. */

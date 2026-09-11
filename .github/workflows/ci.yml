@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          # Hosted runners use the bundled CPU runtime; avoid optional GPU downloads.
+          ONNXRUNTIME_NODE_INSTALL: skip
+
+      - name: Verify pinned runtime manifest
+        run: pnpm run runtime:check
+
+      - name: Type check
+        run: pnpm run check-types
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Unit tests (vitest)
+        run: pnpm run test:unit
+
+      - name: Build production
+        run: node esbuild.js --production
+
+      - name: Production feature smoke
+        run: pnpm run test:runtime
+        env:
+          OPENCURSOR_SMOKE_NATIVE: ${{ matrix.node-version == 22 && '1' || '0' }}
+
+      - name: Compile extension host tests
+        if: matrix.node-version == 22
+        run: pnpm run compile-tests
+
+      - name: Package extension
+        if: matrix.node-version == 22
+        run: npx @vscode/vsce package --no-dependencies --out "$RUNNER_TEMP/ocursor.vsix"
+
+      - name: Test packaged extension in minimum supported host
+        if: matrix.node-version == 22
+        run: |
+          unzip -q "$RUNNER_TEMP/ocursor.vsix" -d "$RUNNER_TEMP/opencursor-vsix"
+          node scripts/extension-host-test.cjs
+        env:
+          OPENCURSOR_TEST_EXTENSION_PATH: ${{ runner.temp }}/opencursor-vsix/extension
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test security scanner
+        run: node --test scripts/check-secrets.test.mjs
+
+      - name: Check for leaked secrets
+        run: node scripts/check-secrets.mjs

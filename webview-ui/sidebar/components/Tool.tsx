@@ -7,6 +7,7 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
+import { parseTodos } from "../../../src/shared/todoPresentation";
 import * as React from "react";
 import { Icon, IconName } from "../../shared/icons";
 import { basename, renderMarkdown } from "../../shared/markdown";
@@ -106,6 +107,10 @@ function toolMeta(name: string, i: any): { icon: IconName; label: string; badge:
     case "grep":
     case "Grep":
       return { icon: "search", label: 'Grep "' + (i.pattern || "") + '"', badge: "Read", cls: "badge-read" };
+    case "Rg":
+      return { icon: "search", label: "rg " + (Array.isArray(i.args) ? i.args.join(" ") : ""), badge: "Read", cls: "badge-read" };
+    case "Wait":
+      return { icon: "task", label: "Wait " + (Number(i.ms) || 0) + "ms" + (i.reason ? " — " + i.reason : ""), badge: "Wait", cls: "badge-read" };
     case "SemanticSearch":
       return { icon: "search", label: "Search " + (i.query || ""), badge: "Read", cls: "badge-read" };
     case "SearchDocs":
@@ -155,23 +160,7 @@ function toolMeta(name: string, i: any): { icon: IconName; label: string; badge:
 }
 
 // Parse "[x] ..." style todo render output into structured items.
-function parseTodos(output: string): { status: string; content: string }[] {
-  const items: { status: string; content: string }[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.trim();
-    let m = line.match(/^\[(x| |~|-)\]\s+(.*)$/);
-    if (m) {
-      const map: Record<string, string> = { x: "completed", " ": "pending", "~": "in_progress", "-": "cancelled" };
-      items.push({ status: map[m[1]] || "pending", content: m[2] });
-      continue;
-    }
-    m = line.match(/^-\s*\[(\w+)\]\s+(.*)$/);
-    if (m) {
-      items.push({ status: m[1], content: m[2] });
-    }
-  }
-  return items;
-}
+
 
 function TodoList({ block }: { block: ToolBlock }) {
   const items = parseTodos(block.result || "");
@@ -578,7 +567,7 @@ export function ReadLine({ block }: { block: ToolBlock }) {
   );
 }
 
-interface QItem { question: string; options?: string[]; multiple?: boolean }
+interface QItem { question: string; options?: string[]; multiple?: boolean; type?: "choices" | "text" | "textArea" | "number" | "date"; required?: boolean; placeholder?: string; id?: string }
 
 // Options may arrive as plain strings or Cursor-shape {id,label} objects; coerce to strings.
 function optLabel(o: any): string {
@@ -591,10 +580,14 @@ function QuestionCard({ block }: { block: ToolBlock }) {
     question: String(q?.question ?? q?.prompt ?? ""),
     options: Array.isArray(q?.options) ? q.options.map(optLabel) : undefined,
     multiple: !!(q?.multiple ?? q?.allow_multiple),
+    type: typeof q?.type === "string" ? q.type : undefined,
+    required: q?.required === true,
+    placeholder: typeof q?.placeholder === "string" ? q.placeholder : undefined,
+    id: typeof q?.id === "string" ? q.id : undefined,
   }));
   const answered = block.status !== "running";
   const [step, setStep] = React.useState(0);
-  const [answers, setAnswers] = React.useState<Record<string, string[]>>({});
+  const [answers, setAnswers] = React.useState<Record<string, string[]>>(block.answers ?? {});
   const [custom, setCustom] = React.useState<Record<string, string>>({});
   const [customMode, setCustomMode] = React.useState<Record<string, boolean>>({});
   const [sent, setSent] = React.useState(false);
@@ -607,6 +600,19 @@ function QuestionCard({ block }: { block: ToolBlock }) {
   const customText = custom[String(step)] || "";
   const customSelected = customMode[String(step)] || false;
   const setCustomSelected = (on: boolean) => setCustomMode((c) => ({ ...c, [String(step)]: on }));
+  const isChoices = !q.type || q.type === "choices";
+  const structuredValue = custom[String(step)] || "";
+  const answerFor = (index: number): string[] => {
+    const item = questions[index];
+    const key = String(index);
+    const text = (custom[key] || "").trim();
+    if (item.type && item.type !== "choices") return text ? [text] : [];
+    const selected = answers[key] || [];
+    if (!customMode[key]) return selected;
+    const choices = item.multiple ? selected : [];
+    return text ? [...new Set([...choices, text])] : choices;
+  };
+  const isValid = !q.required || answerFor(step).length > 0;
 
   const toggle = (opt: string) => {
     if (!q.multiple) setCustomSelected(false);
@@ -622,34 +628,41 @@ function QuestionCard({ block }: { block: ToolBlock }) {
     if (!q.multiple) setAnswers((a) => ({ ...a, [String(step)]: [] }));
     setCustomSelected(true);
   };
-  // Build this step's final answer list, folding in the custom text if chosen.
-  const resolveAnswers = (base: Record<string, string[]>): Record<string, string[]> => {
-    const out = { ...base };
-    const v = (custom[String(step)] || "").trim();
-    if (customSelected && v) {
-      const cur = q.multiple ? (out[String(step)] || []).filter((x) => x !== v) : [];
-      out[String(step)] = [...cur, v];
+  const submit = (skipCurrent = false) => {
+    if (sent || (skipCurrent && q.required)) return;
+    const final = Object.fromEntries(questions.map((_, i) => [String(i), skipCurrent && i === step ? [] : answerFor(i)]));
+    const missing = questions.findIndex((item, i) => item.required && final[String(i)].length === 0);
+    if (missing !== -1) {
+      setStep(missing);
+      return;
     }
-    return out;
-  };
-  const submit = () => {
-    const final = resolveAnswers(answers);
     setAnswers(final);
     setSent(true);
     post({ type: "answerQuestion", callId: block.callId, answers: final });
   };
   const advance = () => {
-    setAnswers((a) => resolveAnswers(a));
+    if (!isValid) return;
     setStep((s) => s + 1);
   };
   const last = step === questions.length - 1;
+  const skip = () => {
+    if (q.required) return;
+    if (last) {
+      submit(true);
+    } else {
+      setAnswers((a) => ({ ...a, [String(step)]: [] }));
+      setCustom((c) => ({ ...c, [String(step)]: "" }));
+      setCustomSelected(false);
+      setStep((s) => s + 1);
+    }
+  };
 
   if (answered || sent) {
     return (
       <div className="question-card done">
         <div className="qc-head"><Icon name="chat" size={14} /> {header}</div>
         {questions.map((qq, i) => {
-          const a = answers[String(i)] || [];
+          const a = (block.answers ?? answers)[String(i)] || [];
           return (
             <div className="qc-answered" key={i}>
               <div className="qc-q">{i + 1}. {qq.question}</div>
@@ -667,41 +680,69 @@ function QuestionCard({ block }: { block: ToolBlock }) {
         <span><Icon name="chat" size={14} /> {header}</span>
         <span className="qc-step">{step + 1} of {questions.length}</span>
       </div>
-      <div className="qc-question">{step + 1}. {q.question}</div>
-      {opts.map((opt, oi) => (
-        <button
-          key={oi}
-          className={"qc-option" + (sel.includes(opt) && !(!q.multiple && customSelected) ? " selected" : "")}
-          onClick={() => toggle(opt)}
-        >
-          <span className="qc-key">{String.fromCharCode(65 + oi)}</span>
-          <span>{opt}</span>
-        </button>
-      ))}
-      <button
-        className={"qc-option qc-option-custom" + (customSelected ? " selected" : "")}
-        onClick={() => (customSelected ? setCustomSelected(false) : pickCustom())}
-      >
-        <span className="qc-key">{String.fromCharCode(65 + opts.length)}</span>
-        <span>Other…</span>
-      </button>
-      {customSelected && (
-        <input
-          className="qc-custom"
-          placeholder="Type a custom answer…"
-          autoFocus
-          value={customText}
-          onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") (last ? submit() : advance());
-          }}
-        />
+      <div className="qc-question">{step + 1}. {q.question}{q.required && <span className="qc-required">*</span>}</div>
+      {isChoices ? (
+        <>
+          {opts.map((opt, oi) => (
+            <button
+              key={oi}
+              className={"qc-option" + (sel.includes(opt) && !(!q.multiple && customSelected) ? " selected" : "")}
+              onClick={() => toggle(opt)}
+            >
+              <span className="qc-key">{String.fromCharCode(65 + oi)}</span>
+              <span>{opt}</span>
+            </button>
+          ))}
+          <button
+            className={"qc-option qc-option-custom" + (customSelected ? " selected" : "")}
+            onClick={() => (customSelected ? setCustomSelected(false) : pickCustom())}
+          >
+            <span className="qc-key">{String.fromCharCode(65 + opts.length)}</span>
+            <span>Other…</span>
+          </button>
+          {customSelected && (
+            <input
+              className="qc-custom"
+              placeholder="Type a custom answer…"
+              autoFocus
+              value={customText}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (last ? submit() : advance());
+              }}
+            />
+          )}
+        </>
+      ) : (
+        <div className="qc-structured">
+          {q.type === "textArea" ? (
+            <textarea
+              className="qc-textarea"
+              placeholder={q.placeholder || "Type your answer…"}
+              autoFocus
+              value={structuredValue}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+            />
+          ) : (
+            <input
+              className="qc-input"
+              type={q.type === "number" ? "number" : q.type === "date" ? "date" : "text"}
+              placeholder={q.placeholder || "Type your answer…"}
+              autoFocus
+              value={structuredValue}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (last ? submit() : advance());
+              }}
+            />
+          )}
+        </div>
       )}
       <div className="qc-foot">
         {step > 0 && <button className="qc-nav" onClick={() => setStep((s) => s - 1)}>Back</button>}
         <span className="qc-spacer" />
-        <button className="qc-skip" onClick={() => (last ? submit() : setStep((s) => s + 1))}>Skip</button>
-        <button className="qc-next" onClick={() => (last ? submit() : advance())}>
+        {!q.required && <button className="qc-skip" onClick={skip}>Skip</button>}
+        <button className="qc-next" disabled={!isValid} onClick={() => (last ? submit() : advance())}>
           {last ? "Submit" : "Continue"}
         </button>
       </div>

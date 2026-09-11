@@ -139,6 +139,40 @@ function isIgnored(rules: IgnoreRule[], rel: string, isDir: boolean): boolean {
   return ignored;
 }
 
+/** Ignore policies shared by scans and incremental indexing. */
+export const IGNORE_POLICY_FILES = [".gitignore", ".cursorignore", ".cursorindexingignore"];
+
+async function directoryIgnoreRules(dir: string, base: string): Promise<IgnoreRule[]> {
+  const rules: IgnoreRule[] = [];
+  for (const name of IGNORE_POLICY_FILES) {
+    try { rules.push(...parseGitignore(await fs.readFile(path.join(dir, name), "utf8"), base)); } catch { /* absent */ }
+  }
+  return rules;
+}
+
+/** Check ancestry before reading content; ignored parents cannot be re-included by children. */
+export async function isPathExcluded(root: string, relIn: string): Promise<boolean> {
+  const rel = toPosix(path.relative(root, path.resolve(root, relIn)));
+  if (!rel || rel === ".." || rel.startsWith("../") || path.isAbsolute(rel)) return true;
+  const parts = rel.split("/");
+  let rules: IgnoreRule[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const base = parts.slice(0, i).join("/");
+    rules.push(...await directoryIgnoreRules(path.join(root, base), base));
+    const candidate = parts.slice(0, i + 1).join("/");
+    const isDir = i < parts.length - 1;
+    if ((isDir && IGNORE.has(parts[i])) || isIgnored(rules, candidate, isDir)) return true;
+  }
+  try {
+    const [actualRoot, actualFile] = await Promise.all([fs.realpath(root), fs.realpath(path.join(root, rel))]);
+    const actualRel = path.relative(actualRoot, actualFile);
+    if (actualRel === ".." || actualRel.startsWith(`..${path.sep}`) || path.isAbsolute(actualRel)) return true;
+    // An allowed alias must not expose a target excluded elsewhere in the workspace.
+    if (toPosix(actualRel) !== rel) return isPathExcluded(root, actualRel);
+  } catch { return true; }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Glob compilation
 // ---------------------------------------------------------------------------
@@ -292,14 +326,7 @@ export async function scanFiles(root: string, opts: ScanOptions = {}): Promise<S
     return false;
   };
 
-  if (useGitignore) {
-    try {
-      const txt = await fs.readFile(path.join(root, ".gitignore"), "utf8");
-      gitRules = parseGitignore(txt, "");
-    } catch {
-      /* no root .gitignore */
-    }
-  }
+  if (useGitignore) gitRules = await directoryIgnoreRules(root, "");
 
   let level: Array<{ abs: string; rel: string; depth: number }> = [{ abs: root, rel: "", depth: 0 }];
 
@@ -319,13 +346,8 @@ export async function scanFiles(root: string, opts: ScanOptions = {}): Promise<S
         }
 
         // Nested .gitignore files refine pruning for their subtree.
-        if (useGitignore && dir.rel && entries.some((e) => e.name === ".gitignore" && e.isFile())) {
-          try {
-            const txt = await fs.readFile(path.join(dir.abs, ".gitignore"), "utf8");
-            gitRules = gitRules.concat(parseGitignore(txt, dir.rel));
-          } catch {
-            /* ignore */
-          }
+        if (useGitignore && dir.rel) {
+          gitRules = gitRules.concat(await directoryIgnoreRules(dir.abs, dir.rel));
         }
 
         for (const e of entries) {
@@ -346,6 +368,7 @@ export async function scanFiles(root: string, opts: ScanOptions = {}): Promise<S
           }
 
           if (!e.isFile() && !e.isSymbolicLink()) continue;
+          if (e.isSymbolicLink() && await isPathExcluded(root, rel)) continue;
           if (useGitignore && gitRules.length && isIgnored(gitRules, rel, false)) continue;
 
           let size = 0;

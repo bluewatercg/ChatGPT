@@ -43,28 +43,52 @@ interface SearchHit {
 /** Parse the DuckDuckGo HTML endpoint (rich: title + url + snippet). */
 function parseDdgHtml(html: string, limit: number): SearchHit[] {
   const hits: SearchHit[] = [];
-  // Each result block contains a result__a link and (usually) a result__snippet.
+  const seen = new Set<string>();
+
+  // Strategy 1: result__body blocks (original DDG HTML layout).
   const blockRe = /<div class="result__body">([\s\S]*?)<\/div>\s*<\/div>/g;
   let bm: RegExpExecArray | null;
   while ((bm = blockRe.exec(html)) && hits.length < limit) {
     const block = bm[1];
     const link = block.match(/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
     if (!link) continue;
+    const url = unwrapDdg(link[1]);
+    if (seen.has(url)) continue;
+    seen.add(url);
     const snip = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
     hits.push({
-      url: unwrapDdg(link[1]),
+      url,
       title: decodeEntities(link[2]) || "(untitled)",
       snippet: snip ? decodeEntities(snip[1]) : undefined,
     });
   }
-  // Fallback: simpler anchor-only parse (covers the lite endpoint / layout drift).
+
+  // Strategy 2: any anchor with /l/?uddg= (DDG redirect wrapper) — works across layouts.
   if (hits.length === 0) {
-    const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    const re = /href="([^"]*\/l\/?\?uddg=[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(html)) && hits.length < limit) {
-      hits.push({ url: unwrapDdg(m[1]), title: decodeEntities(m[2]) || "(untitled)" });
+      const url = unwrapDdg(m[1]);
+      if (seen.has(url) || !url.startsWith("http")) continue;
+      seen.add(url);
+      hits.push({ url, title: decodeEntities(m[2]) || "(untitled)" });
     }
   }
+
+  // Strategy 3: any <a> with external href and meaningful text (broader fallback).
+  if (hits.length === 0) {
+    const re = /<a[^>]*href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) && hits.length < limit) {
+      const url = m[1];
+      if (seen.has(url)) continue;
+      const title = decodeEntities(m[2]);
+      if (!title || title.length < 3) continue;
+      seen.add(url);
+      hits.push({ url, title });
+    }
+  }
+
   return hits;
 }
 
@@ -91,7 +115,7 @@ export const webSearchTool = defineTool("WebSearch", false, async (input, abortS
       // Fallback engine/endpoint.
       hits = await ddgSearch(term, "https://lite.duckduckgo.com/lite/", abortSignal, LIMIT);
     }
-    if (hits.length === 0) return { output: `No results for "${term}".` };
+    if (hits.length === 0) return { output: `No results found for "${term}". Try rephrasing the query or using WebFetch on a specific URL directly.` };
 
     const explanation = input.explanation ? String(input.explanation).trim() : "";
     const header = `Web results for "${term}"${explanation ? ` — ${explanation}` : ""}:`;

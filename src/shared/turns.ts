@@ -11,6 +11,8 @@
 // host (authoritative state, runs in the background) and the webview (pure
 // renderer). Keep this DOM/React-free so it can run in the host.
 
+import type { ToolOutcome } from "../agent/toolOutcome";
+
 export type Mode = "agent" | "ask" | "plan" | "multitask" | "project" | "debug";
 
 export type AgentEvent =
@@ -28,9 +30,10 @@ export type AgentEvent =
       diff?: string;
       startLine?: number;
       endLine?: number;
+      outcome?: ToolOutcome;
     }
   | { type: "run-status"; status: "running" | "finished" | "error" | "cancelled" }
-  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number }
+  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number; model?: string; requestId?: string; source?: "parent" | "summary" | "subagent"; cachedReadTokens?: number; cachedWriteTokens?: number; cacheReadInputTokens?: number }
   | { type: "run-result"; text: string; durationMs: number }
   | { type: "subagent-event"; callId: string; event: AgentEvent }
   | { type: "mode-changed"; mode: Mode }
@@ -56,6 +59,9 @@ export interface ToolBlock {
   input: any;
   status: "running" | "completed" | "error";
   result?: string;
+  outcome?: ToolOutcome;
+  /** Submitted question answers, persisted by the host. */
+  answers?: Record<string, string[]>;
   diff?: string;
   startLine?: number;
   endLine?: number;
@@ -262,7 +268,7 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
     const i = findToolIndex(blocks, ev.callId);
     if (i < 0) return blocksIn;
     const b = blocks[i] as ToolBlock;
-    blocks[i] = { ...b, status: ev.status, result: ev.result, diff: ev.diff, startLine: ev.startLine, endLine: ev.endLine };
+    blocks[i] = { ...b, status: ev.status, result: ev.result, diff: ev.diff, startLine: ev.startLine, endLine: ev.endLine, outcome: ev.outcome ?? b.outcome };
     return blocks;
   } else if (ev.type === "retry") {
     const note: ErrorBlock = { kind: "error", message: ev.error, retrying: { attempt: ev.attempt, max: ev.max } };
@@ -414,6 +420,7 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
             diff: ev.diff ?? b.diff,
             startLine: ev.startLine ?? b.startLine,
             endLine: ev.endLine ?? b.endLine,
+            outcome: ev.outcome ?? b.outcome,
           }
         : {
             ...b,
@@ -422,6 +429,7 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
             diff: ev.diff,
             startLine: ev.startLine,
             endLine: ev.endLine,
+            outcome: ev.outcome ?? b.outcome,
           };
     return list;
   }
@@ -493,7 +501,10 @@ export function forceSettleOpenWork(turns: Turn[], reason: "cancelled" | "error"
         let next: ToolBlock = b;
         if (b.status === "running") {
           changed = true;
-          next = { ...next, status: "error", result: b.result || msg };
+          // TodoWrite/Read: use "completed" instead of "error" to avoid red X
+          const isTodo = b.name === "TodoWrite" || b.name === "TodoRead"
+            || b.name === "todo_write" || b.name === "todo_read";
+          next = { ...next, status: isTodo ? "completed" as const : "error" as const, result: b.result || (isTodo ? "(todos: cancelled)" : msg) };
         }
         const isTask = b.name === "Task" || b.name === "task";
         if (b.subStatus === "running" || (next.status === "error" && isTask && !b.subStatus)) {
@@ -530,4 +541,32 @@ export function closeTrailingThinking(turns: Turn[]): Turn[] {
     }
   }
   return turns;
+}
+
+/** Persist question answers in the same host-owned tree as the question card. */
+export function setQuestionAnswers(turns: Turn[], callId: string, answers: Record<string, string[]>): Turn[] {
+  const update = (blocks: AssistantBlock[]): AssistantBlock[] => blocks.map((block) => {
+    if (block.kind !== "tool") return block;
+    if (block.callId === callId) return { ...block, answers: Object.fromEntries(Object.entries(answers).map(([id, values]) => [id, [...values]])) };
+    return block.subBlocks ? { ...block, subBlocks: update(block.subBlocks) } : block;
+  });
+  return turns.map((turn) => turn.role === "assistant" ? { ...turn, blocks: update(turn.blocks) } : turn);
+}
+
+/** A bounded readable transcript for explicitly attached conversations. */
+export function turnsToTranscript(turns: Turn[], maxChars = 6000): string {
+  const blockText = (block: AssistantBlock): string => {
+    if (block.kind === "text") return block.text;
+    if (block.kind === "tool") return [
+      `${block.name}: ${block.result ?? ""}`,
+      block.answers ? `Answers: ${JSON.stringify(block.answers)}` : "",
+      ...(block.subBlocks?.map(blockText) ?? []),
+    ].filter(Boolean).join("\n");
+    return "";
+  };
+  const text = turns.map((turn) => turn.role === "user" ? `User: ${turn.text}` : `Assistant: ${turn.blocks.map(blockText).filter(Boolean).join("\n")}`).join("\n\n");
+  if (text.length <= maxChars) return text;
+  const marker = "\n[Earlier chat content omitted]\n";
+  const head = Math.max(0, Math.floor((maxChars - marker.length) / 3));
+  return text.slice(0, head) + marker + text.slice(-(maxChars - marker.length - head));
 }

@@ -42,6 +42,7 @@ export type HookEvent =
   | "beforeShell"
   | "beforeMcp"
   | "beforeReadFile"
+  | "beforeEdit"
   | "afterEdit"
   | "afterRun"
   | "notification"
@@ -59,6 +60,7 @@ export const HOOK_EVENTS: { id: HookEvent; label: string; cursor?: string; claud
   { id: "beforeShell", label: "Before shell command", cursor: "beforeShellExecution", claude: "PreToolUse", claudeMatcher: "Bash" },
   { id: "beforeMcp", label: "Before MCP tool", cursor: "beforeMCPExecution", claude: "PreToolUse" },
   { id: "beforeReadFile", label: "Before file read", cursor: "beforeReadFile", claude: "PreToolUse", claudeMatcher: "Read" },
+  { id: "beforeEdit", label: "Before file mutation", claude: "PreToolUse", claudeMatcher: "Write|Edit|NotebookEdit|Delete" },
   { id: "afterEdit", label: "After file edit", cursor: "afterFileEdit", claude: "PostToolUse", claudeMatcher: "Edit" },
   { id: "afterRun", label: "Agent finished (stop)", cursor: "stop", claude: "Stop" },
   { id: "notification", label: "Notification", claude: "Notification" },
@@ -83,7 +85,7 @@ export interface Persona {
   builtin?: boolean;
 }
 
-export type ProviderKind = "openai" | "anthropic" | "google" | "openrouter" | "ollama" | "llamacpp";
+export type ProviderKind = "openai" | "anthropic" | "google" | "openrouter" | "ollama" | "llamacpp" | "mimo" | "atlascloud" | "astraflow";
 
 export interface ProviderConfig {
   id: string;
@@ -103,10 +105,13 @@ export const PROVIDER_PRESETS: Record<ProviderKind, { label: string; baseUrl: st
   openrouter: { label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", needsKey: true },
   ollama: { label: "Ollama", baseUrl: "http://localhost:11434/v1", needsKey: false },
   llamacpp: { label: "llama.cpp", baseUrl: "http://localhost:8080/v1", needsKey: false },
+  mimo: { label: "Xiaomi MIMO", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", needsKey: true },
+  atlascloud: { label: "Atlas Cloud", baseUrl: "https://api.atlascloud.ai/v1", needsKey: true },
+  astraflow: { label: "Astraflow", baseUrl: "https://api-us-ca.umodelverse.ai/v1", needsKey: true },
 };
 
 /** Built-in "popular" providers shown as connect-by-key cards. */
-export const POPULAR_KINDS: ProviderKind[] = ["anthropic", "openai", "google", "openrouter"];
+export const POPULAR_KINDS: ProviderKind[] = ["anthropic", "openai", "google", "openrouter", "mimo", "atlascloud", "astraflow"];
 
 export interface ModelOption {
   key: string;
@@ -232,6 +237,8 @@ export interface OAuthLimit {
 export interface OAuthStatus {
   accounts: OAuthAccountInfo[];
   pending?: OAuthKind;
+  /** Authorization URL for the current pending login; contains no tokens or verifier. */
+  authorizationUrl?: string;
   errors: Partial<Record<OAuthKind, string>>;
   balanceStrategy?: OAuthBalanceStrategy;
 }
@@ -307,6 +314,10 @@ export const DEFAULT_APPROVAL: ApprovalPolicy = {
 
 /** Cumulative token usage for one model (host: usageStore). */
 export interface ModelUsage {
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheWriteReported?: boolean;
   promptTokens: number;
   completionTokens: number;
   requests: number;
